@@ -1,0 +1,19 @@
+displayName: FileConvert Gateway Plugin
+type: middleware
+import: github.com/fileconvert/traefik-gateway-plugin
+
+summary: |
+  API gateway middleware that handles JWT authentication, rate limiting,
+  admin access control, and integrates with service-service, usage-service,
+  and identity-service.
+
+testData:
+  jwtSecret: "test-secret"
+  jwtIssuer: "file-convert.online"
+  redisUrl: "redis://127.0.0.1:6379/0"
+  serviceServiceUrl: "http://service-service:8080"
+  identityServiceUrl: "http://identity-service:8080"
+  usageServiceUrl: "http://usage-service:8080"
+  defaultRateLimitRequests: 30
+  defaultRateLimitDurationSeconds: 60
+  defaultPlanName: "free"

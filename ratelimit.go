@@ -4,31 +4,21 @@ import (
 	"context"
 	"fmt"
 	"time"
-
-	"github.com/redis/go-redis/v9"
 )
 
-// RateLimiter implements a sliding-window rate limiter backed by Redis.
+// RateLimiter implements a fixed-window rate limiter backed by Redis.
 type RateLimiter struct {
-	client *redis.Client
+	client *respRedis
 	prefix string
 }
 
 func newRateLimiter(redisURL, password, prefix string, db int) (*RateLimiter, error) {
-	opts, err := redis.ParseURL(redisURL)
-	if err != nil {
-		opts = &redis.Options{Addr: redisURL}
-	}
-	if password != "" {
-		opts.Password = password
-	}
-	opts.DB = db
-
-	client := redis.NewClient(opts)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if err := client.Ping(ctx).Err(); err != nil {
-		return nil, fmt.Errorf("redis ping failed: %w", err)
+
+	client, err := dialRedis(ctx, redisURL, password, db)
+	if err != nil {
+		return nil, fmt.Errorf("redis dial failed: %w", err)
 	}
 
 	return &RateLimiter{
@@ -46,10 +36,6 @@ type RateLimitResult struct {
 }
 
 // Check performs a fixed-window rate limit check.
-// key: the identity (user ID or session ID)
-// endpointUID: the endpoint being accessed
-// limit: max requests allowed
-// windowSeconds: the window duration
 func (rl *RateLimiter) Check(ctx context.Context, key, endpointUID string, limit, windowSeconds int) (*RateLimitResult, error) {
 	if limit <= 0 {
 		return &RateLimitResult{Allowed: false, Limit: 0}, nil
@@ -62,22 +48,28 @@ func (rl *RateLimiter) Check(ctx context.Context, key, endpointUID string, limit
 
 	redisKey := fmt.Sprintf("%s%s:%s:%d", rl.prefix, key, endpointUID, windowStart.Unix())
 
-	pipe := rl.client.Pipeline()
-	incrCmd := pipe.Incr(ctx, redisKey)
-	pipe.ExpireNX(ctx, redisKey, window+time.Second)
-	_, err := pipe.Exec(ctx)
+	count, err := rl.client.incr(ctx, redisKey)
 	if err != nil {
-		return nil, fmt.Errorf("redis pipeline: %w", err)
+		return nil, fmt.Errorf("redis incr: %w", err)
 	}
 
-	count := int(incrCmd.Val())
-	remaining := limit - count
+	if count == 1 {
+		ttlSec := int((window + time.Second).Seconds())
+		if ttlSec < 1 {
+			ttlSec = 1
+		}
+		if err := rl.client.expire(ctx, redisKey, ttlSec); err != nil {
+			return nil, fmt.Errorf("redis expire: %w", err)
+		}
+	}
+
+	remaining := limit - int(count)
 	if remaining < 0 {
 		remaining = 0
 	}
 
 	return &RateLimitResult{
-		Allowed:   count <= limit,
+		Allowed:   count <= int64(limit),
 		Remaining: remaining,
 		Limit:     limit,
 		ResetAt:   resetAt,

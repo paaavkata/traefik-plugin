@@ -1,4 +1,12 @@
-FROM traefik:v3.1
+FROM golang:1.22 AS vendor
 
-# Copy the plugin source into the local plugins directory.
-COPY . /plugins-local/src/github.com/fileconvert/traefik-gateway-plugin/
+WORKDIR /plugin
+
+COPY go.mod go.sum ./
+COPY *.go ./
+
+RUN go mod vendor
+
+FROM traefik:v3.6.6
+
+COPY --from=vendor /plugin /plugins-local/src/github.com/fileconvert/traefik-gateway-plugin/

@@ -12,15 +12,15 @@ spec:
       jwtIssuer: "file-convert.online"
       jwtHeaderKey: "Authorization"
       sessionIdHeader: "X-Session-Id"
-      redisUrl: "redis://redis-master.redis.svc.cluster.local:6379/0"
+      redisUrl: "redis://redis-master.fc-infra-dev:6379/0"
       redisPassword: ""
       redisDb: 0
       redisPrefix: "gw:rl:"
-      serviceServiceUrl: "http://service-service.default.svc.cluster.local:8080"
+      serviceServiceUrl: "http://service-service.fc-dev:8080"
       snapshotRefreshInterval: "30s"
       snapshotVersionPollInterval: "5s"
-      identityServiceUrl: "http://identity-service.default.svc.cluster.local:8080"
-      usageServiceUrl: "http://usage-service.default.svc.cluster.local:8080"
+      identityServiceUrl: "http://identity-service.fc-dev:8080"
+      usageServiceUrl: "http://usage-service.fc-dev:8080"
       defaultRateLimitRequests: 30
       defaultRateLimitDurationSeconds: 60
       defaultPlanName: "free"

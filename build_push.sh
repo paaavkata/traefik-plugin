@@ -1,6 +1,6 @@
 #! /bin/bash
 
-APP=traefik-gateway-plugin
+APP_NAME=traefik-gateway-plugin
 
 AWS_REGION="eu-west-1"
 REGISTRY_ID=$(aws ecr describe-registry --output text --query 'registryId' --region $AWS_REGION)

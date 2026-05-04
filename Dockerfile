@@ -3,6 +3,7 @@ FROM golang:1.22 AS vendor
 WORKDIR /plugin
 
 COPY go.mod go.sum ./
+COPY .traefik.yml ./
 COPY *.go ./
 
 RUN go mod vendor

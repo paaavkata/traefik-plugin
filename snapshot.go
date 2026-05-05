@@ -179,7 +179,7 @@ func (sc *SnapshotCache) refresh(ctx context.Context) {
 		for _, ep := range svc.Endpoints {
 			compiled = append(compiled, compiledEndpoint{
 				SnapshotEndpointDTO: ep,
-				regex:               compileRegex(ep.PathRegex, ep.FullPath, sc.log),
+				regex:               compileRegex(ep.PathRegex, ep.Path, sc.log),
 			})
 		}
 	}
@@ -193,12 +193,12 @@ func (sc *SnapshotCache) refresh(ctx context.Context) {
 	sc.log.debugf("registry snapshot loaded version=%s services=%d endpoints=%d duration=%s", snap.Version, len(snap.Services), len(compiled), dur)
 }
 
-func compileRegex(pathRegex, fullPath string, log *pluginLogger) *regexp.Regexp {
+func compileRegex(pathRegex, path string, log *pluginLogger) *regexp.Regexp {
 	re, err := regexp.Compile(pathRegex)
 	if err != nil {
-		re = regexp.MustCompile(fmt.Sprintf("^%s$", regexp.QuoteMeta(fullPath)))
+		re = regexp.MustCompile(fmt.Sprintf("^%s$", regexp.QuoteMeta(path)))
 	}
-	log.debugf("compiled regex=%s fullPath=%s", re.String(), fullPath)
+	log.debugf("compiled regex=%s path=%s", re.String(), path)
 	return re
 }
 

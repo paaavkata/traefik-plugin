@@ -14,6 +14,7 @@ import (
 type IdentityClient struct {
 	baseURL string
 	client  *http.Client
+	log     *pluginLogger
 
 	// Cache admin status to avoid repeated calls per request burst.
 	mu         sync.RWMutex
@@ -27,10 +28,11 @@ type adminCacheEntry struct {
 
 const adminCacheTTL = 60 * time.Second
 
-func newIdentityClient(baseURL string, timeout time.Duration) *IdentityClient {
+func newIdentityClient(baseURL string, timeout time.Duration, log *pluginLogger) *IdentityClient {
 	return &IdentityClient{
 		baseURL:    baseURL,
 		client:     &http.Client{Timeout: timeout},
+		log:        log,
 		adminCache: make(map[string]adminCacheEntry),
 	}
 }
@@ -41,11 +43,13 @@ func (ic *IdentityClient) IsAdmin(ctx context.Context, userID string) (bool, err
 	ic.mu.RLock()
 	if entry, ok := ic.adminCache[userID]; ok && time.Now().Before(entry.expiresAt) {
 		ic.mu.RUnlock()
+		ic.log.debugf("identity IsAdmin cache hit user_id=%s is_admin=%v", userID, entry.isAdmin)
 		return entry.isAdmin, nil
 	}
 	ic.mu.RUnlock()
 
 	url := fmt.Sprintf("%s/v1/user/%s/admin-status", ic.baseURL, userID)
+	start := time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return false, err
@@ -53,13 +57,22 @@ func (ic *IdentityClient) IsAdmin(ctx context.Context, userID string) (bool, err
 
 	resp, err := ic.client.Do(req)
 	if err != nil {
+		ic.log.warnf("identity-service request failed user_id=%s duration=%s error=%v", userID, since(start), err)
 		return false, fmt.Errorf("identity-service call failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	body, err := io.ReadAll(resp.Body)
+	dur := since(start)
+	if err != nil {
+		ic.log.warnf("identity-service read body failed user_id=%s duration=%s error=%v", userID, dur, err)
+		return false, err
+	}
+	bodyStr := string(body)
+	ic.log.debugf("identity-service response user_id=%s status=%d duration=%s body=%s", userID, resp.StatusCode, dur, truncateForLog(bodyStr, maxLoggedHTTPBody))
+
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return false, fmt.Errorf("identity-service returned %d: %s", resp.StatusCode, string(body))
+		return false, fmt.Errorf("identity-service returned %d: %s", resp.StatusCode, bodyStr)
 	}
 
 	var result struct {
@@ -68,10 +81,6 @@ func (ic *IdentityClient) IsAdmin(ctx context.Context, userID string) (bool, err
 		Data    struct {
 			IsAdmin bool `json:"is_admin"`
 		} `json:"data"`
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return false, err
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
 		return false, err
@@ -91,6 +100,7 @@ func (ic *IdentityClient) IsAdmin(ctx context.Context, userID string) (bool, err
 type PlanResolver struct {
 	baseURL string
 	client  *http.Client
+	log     *pluginLogger
 	mu      sync.RWMutex
 	cache   map[string]planCacheEntry
 }
@@ -102,10 +112,11 @@ type planCacheEntry struct {
 
 const planCacheTTL = 30 * time.Second
 
-func newPlanResolver(serviceServiceURL string, timeout time.Duration) *PlanResolver {
+func newPlanResolver(serviceServiceURL string, timeout time.Duration, log *pluginLogger) *PlanResolver {
 	return &PlanResolver{
 		baseURL: serviceServiceURL,
 		client:  &http.Client{Timeout: timeout},
+		log:     log,
 		cache:   make(map[string]planCacheEntry),
 	}
 }
@@ -115,31 +126,47 @@ func (pr *PlanResolver) Resolve(ctx context.Context, userID, defaultPlan string)
 	pr.mu.RLock()
 	if entry, ok := pr.cache[userID]; ok && time.Now().Before(entry.expiresAt) {
 		pr.mu.RUnlock()
+		pr.log.debugf("plan resolver cache hit user_id=%s plan=%s", userID, entry.plan)
 		return entry.plan
 	}
 	pr.mu.RUnlock()
 
 	url := fmt.Sprintf("%s/v1/customers/%s/rate-tier", pr.baseURL, userID)
+	start := time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
+		pr.log.warnf("plan resolver build request failed user_id=%s error=%v", userID, err)
 		return defaultPlan
 	}
 
 	resp, err := pr.client.Do(req)
 	if err != nil {
+		pr.log.warnf("plan resolver request failed user_id=%s duration=%s error=%v", userID, since(start), err)
 		return defaultPlan
 	}
 	defer resp.Body.Close()
 
+	body, err := io.ReadAll(resp.Body)
+	dur := since(start)
+	if err != nil {
+		pr.log.warnf("plan resolver read body failed user_id=%s duration=%s error=%v", userID, dur, err)
+		return defaultPlan
+	}
+	bodyStr := string(body)
+	pr.log.debugf("service-service rate-tier response user_id=%s status=%d duration=%s body=%s", userID, resp.StatusCode, dur, truncateForLog(bodyStr, maxLoggedHTTPBody))
+
 	if resp.StatusCode != http.StatusOK {
+		pr.log.debugf("plan resolver non-OK status, using default plan=%s user_id=%s", defaultPlan, userID)
 		return defaultPlan
 	}
 
 	var result struct {
 		PlanName string `json:"plan_name"`
 	}
-	body, _ := io.ReadAll(resp.Body)
 	if err := json.Unmarshal(body, &result); err != nil || result.PlanName == "" {
+		if err != nil {
+			pr.log.debugf("plan resolver json error user_id=%s err=%v body=%s", userID, err, truncateForLog(bodyStr, 512))
+		}
 		return defaultPlan
 	}
 
@@ -150,5 +177,6 @@ func (pr *PlanResolver) Resolve(ctx context.Context, userID, defaultPlan string)
 	}
 	pr.mu.Unlock()
 
+	pr.log.infof("plan resolved user_id=%s plan=%s", userID, result.PlanName)
 	return result.PlanName
 }

@@ -62,9 +62,14 @@ func parseJWT(authHeader, secret, expectedIssuer string) (*TokenClaims, error) {
 		return nil, fmt.Errorf("token expired")
 	}
 
+	expAt := time.Time{}
+	if exp != nil {
+		expAt = exp.Time
+	}
+
 	return &TokenClaims{
 		UserID:    sub,
 		Issuer:    iss,
-		ExpiresAt: exp.Time,
+		ExpiresAt: expAt,
 	}, nil
 }

@@ -19,8 +19,8 @@ type Config struct {
 	RedisPrefix   string `json:"redisPrefix" yaml:"redisPrefix"`
 
 	// Service-service (registry snapshot)
-	ServiceServiceURL          string `json:"serviceServiceUrl" yaml:"serviceServiceUrl"`
-	SnapshotRefreshInterval    string `json:"snapshotRefreshInterval" yaml:"snapshotRefreshInterval"`
+	ServiceServiceURL           string `json:"serviceServiceUrl" yaml:"serviceServiceUrl"`
+	SnapshotRefreshInterval     string `json:"snapshotRefreshInterval" yaml:"snapshotRefreshInterval"`
 	SnapshotVersionPollInterval string `json:"snapshotVersionPollInterval" yaml:"snapshotVersionPollInterval"`
 
 	// Identity-service
@@ -39,12 +39,15 @@ type Config struct {
 	FreeAccessLevel  string `json:"freeAccessLevel" yaml:"freeAccessLevel"`
 
 	// Headers forwarded downstream
-	UserIDHeader    string `json:"userIdHeader" yaml:"userIdHeader"`
-	UserPlanHeader  string `json:"userPlanHeader" yaml:"userPlanHeader"`
-	IsAdminHeader   string `json:"isAdminHeader" yaml:"isAdminHeader"`
+	UserIDHeader   string `json:"userIdHeader" yaml:"userIdHeader"`
+	UserPlanHeader string `json:"userPlanHeader" yaml:"userPlanHeader"`
+	IsAdminHeader  string `json:"isAdminHeader" yaml:"isAdminHeader"`
 
 	// Timeout for upstream service calls
 	HTTPTimeout string `json:"httpTimeout" yaml:"httpTimeout"`
+
+	// Log verbosity: error, warn, info, debug, or none/off/silent.
+	LogLevel string `json:"logLevel" yaml:"logLevel"`
 
 	// Whether to skip rate limiting entirely (for debugging)
 	DisableRateLimit bool `json:"disableRateLimit" yaml:"disableRateLimit"`
@@ -75,6 +78,7 @@ func CreateConfig() *Config {
 		UserPlanHeader:                  "X-User-Plan",
 		IsAdminHeader:                   "X-Is-Admin",
 		HTTPTimeout:                     "5s",
+		LogLevel:                        "info",
 	}
 }
 

@@ -3,12 +3,12 @@
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
-  name: fc-gateway
-  namespace: traefik
+  name: traefik-gateway-plugin
+  namespace: fc-dev
 spec:
   plugin:
     gateway:
-      jwtSecret: "${JWT_SECRET}"
+      jwtSecret: "22LWtG2qr9I0EtNtrb8fzEWmlqRTiw1k7X82A1H6BJc="
       jwtIssuer: "file-convert.online"
       jwtHeaderKey: "Authorization"
       sessionIdHeader: "X-Session-Id"
@@ -32,3 +32,4 @@ spec:
       httpTimeout: "5s"
       disableRateLimit: false
       disableAuth: false
+      logLevel: "info"

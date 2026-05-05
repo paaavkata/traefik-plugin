@@ -14,6 +14,7 @@ testData:
   serviceServiceUrl: "http://service-service:8080"
   identityServiceUrl: "http://identity-service:8080"
   usageServiceUrl: "http://usage-service:8080"
+  logLevel: "error"
   defaultRateLimitRequests: 30
   defaultRateLimitDurationSeconds: 60
   defaultPlanName: "free"

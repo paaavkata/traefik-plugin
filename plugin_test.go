@@ -79,7 +79,7 @@ func TestPlugin_AnonymousRequest_FreeEndpoint(t *testing.T) {
 		name:     "test",
 		config:   config,
 		snapshot: setupTestSnapshot(),
-		identity: newIdentityClient("http://localhost:9999", 1*time.Second),
+		identity: newIdentityClient("http://localhost:9999", 1*time.Second, nil),
 		planResolver: &PlanResolver{
 			cache: make(map[string]planCacheEntry),
 		},
@@ -110,7 +110,7 @@ func TestPlugin_AdminEndpoint_NoAuth(t *testing.T) {
 		name:     "test",
 		config:   config,
 		snapshot: setupTestSnapshot(),
-		identity: newIdentityClient("http://localhost:9999", 1*time.Second),
+		identity: newIdentityClient("http://localhost:9999", 1*time.Second, nil),
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/conversion/v1/admin/users", nil)
@@ -147,7 +147,7 @@ func TestPlugin_AdminEndpoint_NonAdminUser(t *testing.T) {
 		name:     "test",
 		config:   config,
 		snapshot: setupTestSnapshot(),
-		identity: newIdentityClient(identityServer.URL, 5*time.Second),
+		identity: newIdentityClient(identityServer.URL, 5*time.Second, nil),
 	}
 
 	token := createTestToken("test-secret", 42, "file-convert.online", time.Now().Add(time.Hour))
@@ -193,8 +193,8 @@ func TestPlugin_AdminEndpoint_AdminUser(t *testing.T) {
 		name:         "test",
 		config:       config,
 		snapshot:     setupTestSnapshot(),
-		identity:     newIdentityClient(identityServer.URL, 5*time.Second),
-		planResolver: newPlanResolver(serviceServer.URL, 5*time.Second),
+		identity:     newIdentityClient(identityServer.URL, 5*time.Second, nil),
+		planResolver: newPlanResolver(serviceServer.URL, 5*time.Second, nil),
 	}
 
 	token := createTestToken("test-secret", 42, "file-convert.online", time.Now().Add(time.Hour))
@@ -322,8 +322,8 @@ func TestPlugin_AuthenticatedUser_SetsHeaders(t *testing.T) {
 		name:         "test",
 		config:       config,
 		snapshot:     setupTestSnapshot(),
-		identity:     newIdentityClient("http://localhost:9999", 1*time.Second),
-		planResolver: newPlanResolver(serviceServer.URL, 5*time.Second),
+		identity:     newIdentityClient("http://localhost:9999", 1*time.Second, nil),
+		planResolver: newPlanResolver(serviceServer.URL, 5*time.Second, nil),
 	}
 
 	token := createTestToken("test-secret", 99, "file-convert.online", time.Now().Add(time.Hour))

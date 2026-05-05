@@ -20,9 +20,10 @@ type respRedis struct {
 	rd   *bufio.Reader
 	bw   *bufio.Writer
 	mu   sync.Mutex
+	log  *pluginLogger
 }
 
-func dialRedis(ctx context.Context, redisURL, password string, db int) (*respRedis, error) {
+func dialRedis(ctx context.Context, redisURL, password string, db int, log *pluginLogger) (*respRedis, error) {
 	addr, useTLS, pwd, err := parseRedisURL(redisURL, password)
 	if err != nil {
 		return nil, err
@@ -46,6 +47,7 @@ func dialRedis(ctx context.Context, redisURL, password string, db int) (*respRed
 		conn: conn,
 		rd:   bufio.NewReader(conn),
 		bw:   bufio.NewWriter(conn),
+		log:  log,
 	}
 
 	if pwd != "" {
@@ -115,13 +117,24 @@ func (r *respRedis) do(ctx context.Context, args ...string) (interface{}, error)
 	}
 	_ = r.conn.SetDeadline(deadline)
 
+	cmdLogged := formatRedisCmd(args)
+	start := time.Now()
+
 	if err := writeRespArgs(r.bw, args); err != nil {
+		r.log.debugf("redis write cmd=%q error=%v", cmdLogged, err)
 		return nil, err
 	}
 	if err := r.bw.Flush(); err != nil {
+		r.log.debugf("redis flush cmd=%q error=%v", cmdLogged, err)
 		return nil, err
 	}
-	return readRespReply(r.rd)
+	v, err := readRespReply(r.rd)
+	if err != nil {
+		r.log.debugf("redis cmd=%q duration=%s error=%v", cmdLogged, since(start), err)
+		return nil, err
+	}
+	r.log.debugf("redis cmd=%q duration=%s result=%s", cmdLogged, since(start), formatRedisResult(v))
+	return v, nil
 }
 
 func writeRespArgs(w *bufio.Writer, args []string) error {

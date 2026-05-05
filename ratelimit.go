@@ -10,13 +10,14 @@ import (
 type RateLimiter struct {
 	client *respRedis
 	prefix string
+	log    *pluginLogger
 }
 
-func newRateLimiter(redisURL, password, prefix string, db int) (*RateLimiter, error) {
+func newRateLimiter(redisURL, password, prefix string, db int, log *pluginLogger) (*RateLimiter, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	client, err := dialRedis(ctx, redisURL, password, db)
+	client, err := dialRedis(ctx, redisURL, password, db, log)
 	if err != nil {
 		return nil, fmt.Errorf("redis dial failed: %w", err)
 	}
@@ -24,6 +25,7 @@ func newRateLimiter(redisURL, password, prefix string, db int) (*RateLimiter, er
 	return &RateLimiter{
 		client: client,
 		prefix: prefix,
+		log:    log,
 	}, nil
 }
 
@@ -38,9 +40,11 @@ type RateLimitResult struct {
 // Check performs a fixed-window rate limit check.
 func (rl *RateLimiter) Check(ctx context.Context, key, endpointUID string, limit, windowSeconds int) (*RateLimitResult, error) {
 	if limit <= 0 {
+		rl.log.debugf("rate limit skipped limit<=0 endpoint_uid=%s key=%s", endpointUID, key)
 		return &RateLimitResult{Allowed: false, Limit: 0}, nil
 	}
 
+	checkStart := time.Now()
 	window := time.Duration(windowSeconds) * time.Second
 	now := time.Now()
 	windowStart := now.Truncate(window)
@@ -50,6 +54,7 @@ func (rl *RateLimiter) Check(ctx context.Context, key, endpointUID string, limit
 
 	count, err := rl.client.incr(ctx, redisKey)
 	if err != nil {
+		rl.log.debugf("rate limit redis INCR failed duration=%s endpoint_uid=%s error=%v", since(checkStart), endpointUID, err)
 		return nil, fmt.Errorf("redis incr: %w", err)
 	}
 
@@ -59,6 +64,7 @@ func (rl *RateLimiter) Check(ctx context.Context, key, endpointUID string, limit
 			ttlSec = 1
 		}
 		if err := rl.client.expire(ctx, redisKey, ttlSec); err != nil {
+			rl.log.debugf("rate limit redis EXPIRE failed duration=%s endpoint_uid=%s error=%v", since(checkStart), endpointUID, err)
 			return nil, fmt.Errorf("redis expire: %w", err)
 		}
 	}
@@ -68,12 +74,15 @@ func (rl *RateLimiter) Check(ctx context.Context, key, endpointUID string, limit
 		remaining = 0
 	}
 
-	return &RateLimitResult{
+	res := &RateLimitResult{
 		Allowed:   count <= int64(limit),
 		Remaining: remaining,
 		Limit:     limit,
 		ResetAt:   resetAt,
-	}, nil
+	}
+	rl.log.debugf("rate limit check endpoint_uid=%s plan_key=%s redis_key=%s duration=%s incr=%d allowed=%v remaining=%d limit=%d window=%ds reset_unix=%d",
+		endpointUID, key, redisKey, since(checkStart), count, res.Allowed, res.Remaining, res.Limit, windowSeconds, res.ResetAt.Unix())
+	return res, nil
 }
 
 func (rl *RateLimiter) Close() error {

@@ -54,24 +54,26 @@ type compiledEndpoint struct {
 
 // SnapshotCache polls service-service for the registry snapshot and caches it.
 type SnapshotCache struct {
-	mu        sync.RWMutex
-	snapshot  *SnapshotDTO
-	compiled  []compiledEndpoint
-	version   string
-	client    *http.Client
-	baseURL   string
+	mu              sync.RWMutex
+	snapshot        *SnapshotDTO
+	compiled        []compiledEndpoint
+	version         string
+	client          *http.Client
+	baseURL         string
 	refreshInterval time.Duration
 	pollInterval    time.Duration
-	stopCh    chan struct{}
+	stopCh          chan struct{}
+	log             *pluginLogger
 }
 
-func newSnapshotCache(baseURL string, httpTimeout, refreshInterval, pollInterval time.Duration) *SnapshotCache {
+func newSnapshotCache(baseURL string, httpTimeout, refreshInterval, pollInterval time.Duration, log *pluginLogger) *SnapshotCache {
 	sc := &SnapshotCache{
 		client:          &http.Client{Timeout: httpTimeout},
 		baseURL:         baseURL,
 		refreshInterval: refreshInterval,
 		pollInterval:    pollInterval,
 		stopCh:          make(chan struct{}),
+		log:             log,
 	}
 	return sc
 }
@@ -104,20 +106,29 @@ func (sc *SnapshotCache) loop() {
 }
 
 func (sc *SnapshotCache) checkVersion() {
+	start := time.Now()
 	resp, err := sc.client.Get(sc.baseURL + "/v1/registry/version")
 	if err != nil {
+		sc.log.warnf("registry version poll failed duration=%s error=%v", since(start), err)
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	body, err := io.ReadAll(resp.Body)
+	dur := since(start)
+	if err != nil {
+		sc.log.warnf("registry version read body failed duration=%s error=%v", dur, err)
 		return
 	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
+	bodyStr := string(body)
+	sc.log.debugf("service-service registry/version response status=%d duration=%s body=%s", resp.StatusCode, dur, truncateForLog(bodyStr, maxLoggedHTTPBody))
+
+	if resp.StatusCode != http.StatusOK {
+		sc.log.warnf("registry version non-OK status=%d duration=%s", resp.StatusCode, dur)
 		return
 	}
 	var v SnapshotVersionDTO
 	if err := json.Unmarshal(body, &v); err != nil {
+		sc.log.warnf("registry version json error duration=%s err=%v body=%s", dur, err, truncateForLog(bodyStr, 512))
 		return
 	}
 
@@ -126,29 +137,40 @@ func (sc *SnapshotCache) checkVersion() {
 	sc.mu.RUnlock()
 
 	if v.Version != current {
+		sc.log.infof("registry version changed from %q to %q, refreshing snapshot", current, v.Version)
 		sc.refresh(context.Background())
 	}
 }
 
 func (sc *SnapshotCache) refresh(ctx context.Context) {
+	start := time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sc.baseURL+"/v1/registry/snapshot", nil)
 	if err != nil {
+		sc.log.errorf("registry snapshot build request failed error=%v", err)
 		return
 	}
 	resp, err := sc.client.Do(req)
 	if err != nil {
+		sc.log.warnf("registry snapshot request failed duration=%s error=%v", since(start), err)
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	body, err := io.ReadAll(resp.Body)
+	dur := since(start)
+	if err != nil {
+		sc.log.warnf("registry snapshot read body failed duration=%s error=%v", dur, err)
 		return
 	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
+	bodyStr := string(body)
+	sc.log.debugf("service-service registry/snapshot response status=%d duration=%s body=%s", resp.StatusCode, dur, truncateForLog(bodyStr, maxLoggedHTTPBody))
+
+	if resp.StatusCode != http.StatusOK {
+		sc.log.warnf("registry snapshot non-OK status=%d duration=%s", resp.StatusCode, dur)
 		return
 	}
 	var snap SnapshotDTO
 	if err := json.Unmarshal(body, &snap); err != nil {
+		sc.log.warnf("registry snapshot json error duration=%s err=%v body_prefix=%s", dur, err, truncateForLog(bodyStr, 512))
 		return
 	}
 
@@ -167,6 +189,8 @@ func (sc *SnapshotCache) refresh(ctx context.Context) {
 	sc.compiled = compiled
 	sc.version = snap.Version
 	sc.mu.Unlock()
+
+	sc.log.infof("registry snapshot loaded version=%s services=%d endpoints=%d duration=%s", snap.Version, len(snap.Services), len(compiled), dur)
 }
 
 func compileRegex(pathRegex, fullPath string) *regexp.Regexp {

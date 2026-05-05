@@ -16,11 +16,11 @@ spec:
       redisPassword: ""
       redisDb: 0
       redisPrefix: "gw:rl:"
-      serviceServiceUrl: "http://service-service.fc-dev:8080"
+      serviceServiceUrl: "http://service-service.fc-dev"
       snapshotRefreshInterval: "30s"
       snapshotVersionPollInterval: "5s"
-      identityServiceUrl: "http://identity-service.fc-dev:8080"
-      usageServiceUrl: "http://usage-service.fc-dev:8080"
+      identityServiceUrl: "http://identity-service.fc-dev"
+      usageServiceUrl: "http://usage-service.fc-dev"
       defaultRateLimitRequests: 30
       defaultRateLimitDurationSeconds: 60
       defaultPlanName: "free"
@@ -32,4 +32,4 @@ spec:
       httpTimeout: "5s"
       disableRateLimit: false
       disableAuth: false
-      logLevel: "info"
+      logLevel: "debug"

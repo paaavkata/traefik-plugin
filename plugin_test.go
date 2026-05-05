@@ -54,7 +54,7 @@ func setupTestSnapshot() *SnapshotCache {
 	compiled := make([]compiledEndpoint, 0)
 	for _, svc := range sc.snapshot.Services {
 		for _, ep := range svc.Endpoints {
-			re := compileRegex(ep.PathRegex, ep.FullPath)
+			re := compileRegex(ep.PathRegex, ep.FullPath, nil)
 			compiled = append(compiled, compiledEndpoint{
 				SnapshotEndpointDTO: ep,
 				regex:               re,

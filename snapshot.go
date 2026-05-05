@@ -137,7 +137,7 @@ func (sc *SnapshotCache) checkVersion() {
 	sc.mu.RUnlock()
 
 	if v.Version != current {
-		sc.log.infof("registry version changed from %q to %q, refreshing snapshot", current, v.Version)
+		sc.log.debugf("registry version changed from %q to %q, refreshing snapshot", current, v.Version)
 		sc.refresh(context.Background())
 	}
 }
@@ -179,7 +179,7 @@ func (sc *SnapshotCache) refresh(ctx context.Context) {
 		for _, ep := range svc.Endpoints {
 			compiled = append(compiled, compiledEndpoint{
 				SnapshotEndpointDTO: ep,
-				regex:               compileRegex(ep.PathRegex, ep.FullPath),
+				regex:               compileRegex(ep.PathRegex, ep.FullPath, sc.log),
 			})
 		}
 	}
@@ -190,19 +190,21 @@ func (sc *SnapshotCache) refresh(ctx context.Context) {
 	sc.version = snap.Version
 	sc.mu.Unlock()
 
-	sc.log.infof("registry snapshot loaded version=%s services=%d endpoints=%d duration=%s", snap.Version, len(snap.Services), len(compiled), dur)
+	sc.log.debugf("registry snapshot loaded version=%s services=%d endpoints=%d duration=%s", snap.Version, len(snap.Services), len(compiled), dur)
 }
 
-func compileRegex(pathRegex, fullPath string) *regexp.Regexp {
+func compileRegex(pathRegex, fullPath string, log *pluginLogger) *regexp.Regexp {
 	re, err := regexp.Compile(pathRegex)
 	if err != nil {
 		re = regexp.MustCompile(fmt.Sprintf("^%s$", regexp.QuoteMeta(fullPath)))
 	}
+	log.debugf("compiled regex=%s fullPath=%s", re.String(), fullPath)
 	return re
 }
 
 // matchEndpoint finds the endpoint matching the given method+path.
 func (sc *SnapshotCache) matchEndpoint(method, path string) *compiledEndpoint {
+	sc.log.debugf("matching endpoint method=%s path=%s", method, path)
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
 

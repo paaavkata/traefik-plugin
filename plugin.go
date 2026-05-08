@@ -163,6 +163,7 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				rw.Header().Set("X-RateLimit-Remaining", "0")
 				rw.Header().Set("X-RateLimit-Reset", strconv.FormatInt(result.ResetAt.Unix(), 10))
 				rw.Header().Set("Retry-After", strconv.Itoa(int(time.Until(result.ResetAt).Seconds())))
+				rw.Header().Set("Access-Control-Expose-Headers", "X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, Retry-After")
 				writeJSON(rw, http.StatusTooManyRequests, map[string]string{
 					"error":   "rate_limit_exceeded",
 					"message": "too many requests",
@@ -173,6 +174,7 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				rw.Header().Set("X-RateLimit-Limit", strconv.Itoa(result.Limit))
 				rw.Header().Set("X-RateLimit-Remaining", strconv.Itoa(result.Remaining))
 				rw.Header().Set("X-RateLimit-Reset", strconv.FormatInt(result.ResetAt.Unix(), 10))
+				rw.Header().Set("Access-Control-Expose-Headers", "X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, Retry-After")
 			}
 		}
 	}

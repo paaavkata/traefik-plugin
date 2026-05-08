@@ -32,4 +32,4 @@ spec:
       httpTimeout: "5s"
       disableRateLimit: false
       disableAuth: false
-      logLevel: "debug"
+      logLevel: "info"

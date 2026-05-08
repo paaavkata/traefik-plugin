@@ -54,6 +54,15 @@ type Config struct {
 
 	// Whether to skip JWT validation (for debugging/local)
 	DisableAuth bool `json:"disableAuth" yaml:"disableAuth"`
+
+	// CORS — leave CORSAllowedOrigins empty to disable CORS handling.
+	// Supports exact origins ("https://file-convert.online") and wildcard
+	// subdomain patterns ("https://*.file-convert.online").
+	CORSAllowedOrigins   []string `json:"corsAllowedOrigins" yaml:"corsAllowedOrigins"`
+	CORSAllowedMethods   []string `json:"corsAllowedMethods" yaml:"corsAllowedMethods"`
+	CORSAllowedHeaders   []string `json:"corsAllowedHeaders" yaml:"corsAllowedHeaders"`
+	CORSAllowCredentials bool     `json:"corsAllowCredentials" yaml:"corsAllowCredentials"`
+	CORSMaxAge           int      `json:"corsMaxAge" yaml:"corsMaxAge"`
 }
 
 // CreateConfig creates the default plugin configuration.
@@ -69,6 +78,10 @@ func CreateConfig() *Config {
 		SnapshotVersionPollInterval:     "5s",
 		IdentityServiceURL:              "http://identity-service:8080",
 		UsageServiceURL:                 "http://usage-service:8080",
+		CORSAllowedMethods:              []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		CORSAllowedHeaders:              []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Session-Id"},
+		CORSAllowCredentials:            true,
+		CORSMaxAge:                      3600,
 		DefaultRateLimitRequests:        30,
 		DefaultRateLimitDurationSeconds: 60,
 		DefaultPlanName:                 "free",

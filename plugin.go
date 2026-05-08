@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -62,8 +63,52 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	return plugin, nil
 }
 
+// applyCORSHeaders sets Access-Control-* headers when the request Origin matches
+// a configured allowed origin. Returns true if the origin was allowed.
+func (p *GatewayPlugin) applyCORSHeaders(rw http.ResponseWriter, origin string) bool {
+	for _, allowed := range p.config.CORSAllowedOrigins {
+		matched := allowed == origin
+		if !matched && strings.HasPrefix(allowed, "https://*.") {
+			suffix := allowed[len("https://*"):]
+			matched = strings.HasPrefix(origin, "https://") && strings.HasSuffix(origin, suffix)
+		}
+		if !matched && strings.HasPrefix(allowed, "http://*.") {
+			suffix := allowed[len("http://*"):]
+			matched = strings.HasPrefix(origin, "http://") && strings.HasSuffix(origin, suffix)
+		}
+		if matched {
+			rw.Header().Set("Access-Control-Allow-Origin", origin)
+			if p.config.CORSAllowCredentials {
+				rw.Header().Set("Access-Control-Allow-Credentials", "true")
+			}
+			rw.Header().Set("Access-Control-Expose-Headers", "X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, Retry-After")
+			rw.Header().Add("Vary", "Origin")
+			return true
+		}
+	}
+	return false
+}
+
 func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	ctx := req.Context()
+
+	// 0. CORS — must run before everything so that preflight bypasses auth/rate-limiting
+	// and all plugin-generated error responses carry the correct CORS headers.
+	if len(p.config.CORSAllowedOrigins) > 0 {
+		origin := req.Header.Get("Origin")
+		if origin != "" {
+			p.applyCORSHeaders(rw, origin)
+		}
+		if req.Method == http.MethodOptions {
+			rw.Header().Set("Access-Control-Allow-Methods", strings.Join(p.config.CORSAllowedMethods, ", "))
+			rw.Header().Set("Access-Control-Allow-Headers", strings.Join(p.config.CORSAllowedHeaders, ", "))
+			if p.config.CORSMaxAge > 0 {
+				rw.Header().Set("Access-Control-Max-Age", strconv.Itoa(p.config.CORSMaxAge))
+			}
+			rw.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
 
 	// 1. Match the request against the registry snapshot
 	ep := p.snapshot.matchEndpoint(req.Method, req.URL.Path)
@@ -163,7 +208,6 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				rw.Header().Set("X-RateLimit-Remaining", "0")
 				rw.Header().Set("X-RateLimit-Reset", strconv.FormatInt(result.ResetAt.Unix(), 10))
 				rw.Header().Set("Retry-After", strconv.Itoa(int(time.Until(result.ResetAt).Seconds())))
-				rw.Header().Set("Access-Control-Expose-Headers", "X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, Retry-After")
 				writeJSON(rw, http.StatusTooManyRequests, map[string]string{
 					"error":   "rate_limit_exceeded",
 					"message": "too many requests",
@@ -174,7 +218,6 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				rw.Header().Set("X-RateLimit-Limit", strconv.Itoa(result.Limit))
 				rw.Header().Set("X-RateLimit-Remaining", strconv.Itoa(result.Remaining))
 				rw.Header().Set("X-RateLimit-Reset", strconv.FormatInt(result.ResetAt.Unix(), 10))
-				rw.Header().Set("Access-Control-Expose-Headers", "X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, Retry-After")
 			}
 		}
 	}

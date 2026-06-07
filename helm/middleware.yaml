@@ -33,3 +33,36 @@ spec:
       disableRateLimit: false
       disableAuth: false
       logLevel: "info"
+      # CORS — handled centrally by the plugin so that auth/rate-limit error
+      # responses (401, 403, 429) also carry the correct ACAO header.
+      # The apex domain and the wildcard pattern cover all subdomains
+      # (admin., dev., audio., video., image., document., ebook., archive.).
+      corsAllowedOrigins:
+        - "https://file-convert.online"
+        - "https://*.file-convert.online"
+        # Dev/local convenience — remove in a production-only middleware manifest.
+        - "http://localhost:3000"
+        - "http://localhost:3001"
+        - "http://localhost:5173"
+        - "http://localhost:4200"
+        - "http://localhost:8080"
+        - "http://127.0.0.1:3000"
+        - "http://127.0.0.1:3001"
+        - "http://127.0.0.1:5173"
+        - "http://127.0.0.1:4200"
+        - "http://127.0.0.1:8080"
+      corsAllowedMethods:
+        - "GET"
+        - "POST"
+        - "PUT"
+        - "PATCH"
+        - "DELETE"
+        - "OPTIONS"
+      corsAllowedHeaders:
+        - "Origin"
+        - "Content-Type"
+        - "Accept"
+        - "Authorization"
+        - "X-Session-Id"
+      corsAllowCredentials: true
+      corsMaxAge: 3600

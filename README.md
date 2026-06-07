@@ -43,6 +43,11 @@ All options are configurable via the Traefik Middleware CRD (see `helm/middlewar
 | `httpTimeout` | `5s` | Timeout for upstream HTTP calls |
 | `disableRateLimit` | `false` | Skip rate limiting (debug) |
 | `disableAuth` | `false` | Skip JWT validation (debug) |
+| `corsAllowedOrigins` | `[]` | Allowed CORS origins. Supports exact strings and `https://*.domain` wildcard subdomain patterns. Leave empty to disable plugin-level CORS (not recommended). |
+| `corsAllowedMethods` | `GET POST PUT PATCH DELETE OPTIONS` | Comma-separated list of allowed HTTP methods |
+| `corsAllowedHeaders` | `Origin Content-Type Accept Authorization X-Session-Id` | Allowed request headers |
+| `corsAllowCredentials` | `true` | Sets `Access-Control-Allow-Credentials` |
+| `corsMaxAge` | `3600` | Preflight cache TTL in seconds |
 
 ## Deployment
 

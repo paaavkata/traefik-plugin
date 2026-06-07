@@ -38,8 +38,8 @@ spec:
       # The apex domain and the wildcard pattern cover all subdomains
       # (admin., dev., audio., video., image., document., ebook., archive.).
       corsAllowedOrigins:
-        - "https://file-convert.online"
-        - "https://*.file-convert.online"
+        - "https://dev.file-convert.online"
+        - "https://admin.dev.file-convert.online"
         # Dev/local convenience — remove in a production-only middleware manifest.
         - "http://localhost:3000"
         - "http://localhost:3001"

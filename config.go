@@ -12,6 +12,9 @@ type Config struct {
 	// Session ID header for anonymous rate-limiting
 	SessionIDHeader string `json:"sessionIdHeader" yaml:"sessionIdHeader"`
 
+	// Device ID header for reset-resistant anonymous rate-limiting (FingerprintJS visitorId).
+	DeviceIDHeader string `json:"deviceIdHeader" yaml:"deviceIdHeader"`
+
 	// Redis
 	RedisURL      string `json:"redisUrl" yaml:"redisUrl"`
 	RedisPassword string `json:"redisPassword" yaml:"redisPassword"`
@@ -71,6 +74,7 @@ func CreateConfig() *Config {
 		JWTIssuer:                       "file-convert.online",
 		JWTHeaderKey:                    "Authorization",
 		SessionIDHeader:                 "X-Session-Id",
+		DeviceIDHeader:                  "X-Device-Id",
 		RedisURL:                        "redis://127.0.0.1:6379/0",
 		RedisPrefix:                     "gw:rl:",
 		ServiceServiceURL:               "http://service-service:8080",
@@ -79,7 +83,7 @@ func CreateConfig() *Config {
 		IdentityServiceURL:              "http://identity-service:8080",
 		UsageServiceURL:                 "http://usage-service:8080",
 		CORSAllowedMethods:              []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		CORSAllowedHeaders:              []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Session-Id"},
+		CORSAllowedHeaders:              []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Session-Id", "X-Device-Id"},
 		CORSAllowCredentials:            true,
 		CORSMaxAge:                      3600,
 		DefaultRateLimitRequests:        30,

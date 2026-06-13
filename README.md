@@ -30,7 +30,8 @@ All options are configurable via the Traefik Middleware CRD (see `helm/middlewar
 |-----|---------|-------------|
 | `jwtSecret` | — | HMAC secret for JWT verification |
 | `jwtIssuer` | `file-convert.online` | Expected JWT issuer |
-| `sessionIdHeader` | `X-Session-Id` | Header for anonymous rate-limit key |
+| `sessionIdHeader` | `X-Session-Id` | Header for anonymous session identity |
+| `deviceIdHeader` | `X-Device-Id` | FingerprintJS visitor id; preferred anonymous rate-limit key |
 | `redisUrl` | `redis://127.0.0.1:6379/0` | Redis connection URL |
 | `redisPrefix` | `gw:rl:` | Key prefix for rate limit counters |
 | `serviceServiceUrl` | `http://service-service:8080` | Service registry URL |
@@ -45,7 +46,7 @@ All options are configurable via the Traefik Middleware CRD (see `helm/middlewar
 | `disableAuth` | `false` | Skip JWT validation (debug) |
 | `corsAllowedOrigins` | `[]` | Allowed CORS origins. Supports exact strings and `https://*.domain` wildcard subdomain patterns. Leave empty to disable plugin-level CORS (not recommended). |
 | `corsAllowedMethods` | `GET POST PUT PATCH DELETE OPTIONS` | Comma-separated list of allowed HTTP methods |
-| `corsAllowedHeaders` | `Origin Content-Type Accept Authorization X-Session-Id` | Allowed request headers |
+| `corsAllowedHeaders` | `Origin Content-Type Accept Authorization X-Session-Id X-Device-Id` | Allowed request headers |
 | `corsAllowCredentials` | `true` | Sets `Access-Control-Allow-Credentials` |
 | `corsMaxAge` | `3600` | Preflight cache TTL in seconds |
 

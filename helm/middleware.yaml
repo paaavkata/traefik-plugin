@@ -12,6 +12,7 @@ spec:
       jwtIssuer: "file-convert.online"
       jwtHeaderKey: "Authorization"
       sessionIdHeader: "X-Session-Id"
+      deviceIdHeader: "X-Device-Id"
       redisUrl: "redis://redis-master.fc-infra-dev:6379/0"
       redisPassword: ""
       redisDb: 0
@@ -64,5 +65,6 @@ spec:
         - "Accept"
         - "Authorization"
         - "X-Session-Id"
+        - "X-Device-Id"
       corsAllowCredentials: true
       corsMaxAge: 3600

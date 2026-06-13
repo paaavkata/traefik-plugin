@@ -189,16 +189,16 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		req.Header.Del(p.config.SessionIDHeader)
 	} else {
 		sessionID := req.Header.Get(p.config.SessionIDHeader)
+		deviceID := req.Header.Get(p.config.DeviceIDHeader)
 		if sessionID != "" {
 			// Forward the validated session ID so downstream services can use it for
 			// credit metering (subject type = "session").
 			req.Header.Set(p.config.SessionIDHeader, sessionID)
-			rateLimitKey = "session:" + sessionID
-		} else {
-			// No stable session identity — use remote address for rate-limiting only;
-			// do NOT forward it downstream as a session ID.
-			rateLimitKey = "session:" + req.RemoteAddr
 		}
+		if deviceID != "" {
+			req.Header.Set(p.config.DeviceIDHeader, deviceID)
+		}
+		rateLimitKey = anonymousRateLimitKey(deviceID, sessionID, clientIP(req))
 		planName = p.config.DefaultPlanName
 	}
 

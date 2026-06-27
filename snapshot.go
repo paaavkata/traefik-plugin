@@ -78,16 +78,48 @@ func newSnapshotCache(baseURL string, httpTimeout, refreshInterval, pollInterval
 	return sc
 }
 
+// sharedCaches holds one running SnapshotCache per serviceServiceUrl for the
+// lifetime of the Traefik process.
+//
+// Traefik instantiates a plugin middleware once per router that references it and
+// rebuilds every instance on each config reload. Without sharing, each instance
+// would spawn its own polling goroutine — and because the old instances are never
+// stopped on reload, those goroutines accumulate, flooding service-service with
+// /v1/registry/version and /v1/registry/snapshot requests. Sharing collapses all
+// of that down to a single poller per upstream URL.
+var (
+	sharedCachesMu sync.Mutex
+	sharedCaches   = make(map[string]*SnapshotCache)
+)
+
+// getSharedSnapshotCache returns the process-wide SnapshotCache for baseURL,
+// creating and starting it on first use. Subsequent calls (additional routers,
+// config reloads) reuse the already-running poller.
+func getSharedSnapshotCache(baseURL string, httpTimeout, refreshInterval, pollInterval time.Duration, log *pluginLogger) *SnapshotCache {
+	sharedCachesMu.Lock()
+	defer sharedCachesMu.Unlock()
+
+	if sc, ok := sharedCaches[baseURL]; ok {
+		return sc
+	}
+
+	sc := newSnapshotCache(baseURL, httpTimeout, refreshInterval, pollInterval, log)
+	// Use a process-lifetime context; the shared poller is never torn down.
+	sc.start(context.Background())
+	sharedCaches[baseURL] = sc
+	return sc
+}
+
 func (sc *SnapshotCache) start(ctx context.Context) {
 	sc.refresh(ctx)
-	go sc.loop()
+	go sc.loop(ctx)
 }
 
 func (sc *SnapshotCache) stop() {
 	close(sc.stopCh)
 }
 
-func (sc *SnapshotCache) loop() {
+func (sc *SnapshotCache) loop(ctx context.Context) {
 	pollTicker := time.NewTicker(sc.pollInterval)
 	refreshTicker := time.NewTicker(sc.refreshInterval)
 	defer pollTicker.Stop()
@@ -95,12 +127,14 @@ func (sc *SnapshotCache) loop() {
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-sc.stopCh:
 			return
 		case <-pollTicker.C:
 			sc.checkVersion()
 		case <-refreshTicker.C:
-			sc.refresh(context.Background())
+			sc.refresh(ctx)
 		}
 	}
 }

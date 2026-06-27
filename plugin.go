@@ -41,9 +41,10 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		log:    plog,
 	}
 
-	// Snapshot cache
-	plugin.snapshot = newSnapshotCache(config.ServiceServiceURL, httpTimeout, refreshInterval, pollInterval, plog)
-	plugin.snapshot.start(ctx)
+	// Snapshot cache — shared process-wide so that the many routers referencing this
+	// middleware (and Traefik's per-reload rebuilds) reuse a single poller instead of
+	// each spawning its own and flooding service-service.
+	plugin.snapshot = getSharedSnapshotCache(config.ServiceServiceURL, httpTimeout, refreshInterval, pollInterval, plog)
 
 	// Rate limiter (Redis)
 	if !config.DisableRateLimit {

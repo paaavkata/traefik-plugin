@@ -34,6 +34,19 @@ func clientIP(req *http.Request) string {
 	return host
 }
 
+// normalizeHost canonicalizes a request host for registry lookup: lowercase,
+// strip any :port, and strip a trailing dot (FQDN form). Mirrors the normalization
+// application-service applies on write (guide §11).
+func normalizeHost(host string) string {
+	h := strings.TrimSpace(host)
+	if hh, _, err := net.SplitHostPort(h); err == nil {
+		h = hh
+	}
+	h = strings.ToLower(h)
+	h = strings.TrimSuffix(h, ".")
+	return h
+}
+
 // anonymousRateLimitKey prefers device_id, then session_id, then client IP.
 func anonymousRateLimitKey(deviceID, sessionID, ip string) string {
 	if deviceID != "" {

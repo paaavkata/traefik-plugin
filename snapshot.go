@@ -12,10 +12,20 @@ import (
 )
 
 // SnapshotDTO mirrors service-service's GET /v1/registry/snapshot response.
+// Top-level apps[] wrapper (guide §11): each app carries its exposed services
+// (a shared service appears under every active app's subtree). The gateway
+// resolves host→app_id, then matches (app_id, method, path_regex).
 type SnapshotDTO struct {
-	Version     string               `json:"version"`
-	GeneratedAt time.Time            `json:"generated_at"`
-	Services    []SnapshotServiceDTO `json:"services"`
+	Version     string           `json:"version"`
+	GeneratedAt time.Time        `json:"generated_at"`
+	Apps        []SnapshotAppDTO `json:"apps"`
+}
+
+// SnapshotAppDTO groups one app's exposed services. app_id lives here (not on
+// the service), matching service-service's emitted shape.
+type SnapshotAppDTO struct {
+	AppID    string               `json:"app_id"`
+	Services []SnapshotServiceDTO `json:"services"`
 }
 
 type SnapshotServiceDTO struct {
@@ -49,6 +59,8 @@ type SnapshotVersionDTO struct {
 // compiledEndpoint holds a pre-compiled regex for fast matching.
 type compiledEndpoint struct {
 	SnapshotEndpointDTO
+	// AppID is carried up from the owning service; empty/"*" = shared across apps.
+	AppID string
 	regex *regexp.Regexp
 }
 
@@ -209,12 +221,15 @@ func (sc *SnapshotCache) refresh(ctx context.Context) {
 	}
 
 	compiled := make([]compiledEndpoint, 0)
-	for _, svc := range snap.Services {
-		for _, ep := range svc.Endpoints {
-			compiled = append(compiled, compiledEndpoint{
-				SnapshotEndpointDTO: ep,
-				regex:               compileRegex(ep.PathRegex, ep.FullPath),
-			})
+	for _, app := range snap.Apps {
+		for _, svc := range app.Services {
+			for _, ep := range svc.Endpoints {
+				compiled = append(compiled, compiledEndpoint{
+					SnapshotEndpointDTO: ep,
+					AppID:               app.AppID,
+					regex:               compileRegex(ep.PathRegex, ep.FullPath),
+				})
+			}
 		}
 	}
 
@@ -224,7 +239,7 @@ func (sc *SnapshotCache) refresh(ctx context.Context) {
 	sc.version = snap.Version
 	sc.mu.Unlock()
 
-	sc.log.debugf("registry snapshot loaded version=%s services=%d endpoints=%d duration=%s", snap.Version, len(snap.Services), len(compiled), dur)
+	sc.log.debugf("registry snapshot loaded version=%s apps=%d endpoints=%d duration=%s", snap.Version, len(snap.Apps), len(compiled), dur)
 }
 
 func compileRegex(pathRegex, fullPath string) *regexp.Regexp {
@@ -235,19 +250,45 @@ func compileRegex(pathRegex, fullPath string) *regexp.Regexp {
 	return re
 }
 
-// matchEndpoint finds the endpoint matching the given method+path.
-func (sc *SnapshotCache) matchEndpoint(method, path string) *compiledEndpoint {
+// matchEndpoint finds the endpoint matching (appID, method, path).
+//
+//   - appID != "": an exact-app endpoint (ep.AppID == appID) is preferred over a
+//     shared/global one (ep.AppID "" or "*"), so an app can override a shared
+//     endpoint's policy. If neither matches, the endpoint is not registered for
+//     this app → no match (caller passes through / denies per policy).
+//   - appID == "" (app resolution not active — permissive bootstrap before the
+//     registry is wired): apply policy regardless of app, so a single-app
+//     deployment stays policed. service-service now always emits concrete app_ids
+//     (shared services are duplicated per app), so there are no "" endpoints to
+//     fall back to; matching any app's endpoint preserves Phase-0 behaviour.
+func (sc *SnapshotCache) matchEndpoint(appID, method, path string) *compiledEndpoint {
 	sc.mu.RLock()
 	defer sc.mu.RUnlock()
 
+	var sharedMatch, anyMatch *compiledEndpoint
 	for i := range sc.compiled {
 		ep := &sc.compiled[i]
 		if ep.Method != method {
 			continue
 		}
-		if ep.regex.MatchString(path) {
-			return ep
+		if !ep.regex.MatchString(path) {
+			continue
 		}
+		if appID != "" && ep.AppID == appID {
+			return ep // exact-app match wins immediately
+		}
+		if (ep.AppID == "" || ep.AppID == "*") && sharedMatch == nil {
+			sharedMatch = ep
+		}
+		if anyMatch == nil {
+			anyMatch = ep
+		}
+	}
+	if sharedMatch != nil {
+		return sharedMatch
+	}
+	if appID == "" {
+		return anyMatch // unresolved app: policy applies regardless of app
 	}
 	return nil
 }

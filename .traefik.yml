@@ -12,6 +12,8 @@ testData:
   jwtIssuer: "file-convert.online"
   redisUrl: "redis://127.0.0.1:6379/0"
   serviceServiceUrl: "http://service-service:8080"
+  applicationServiceUrl: "http://application-service:8080"
+  appResolutionMode: "permissive"
   identityServiceUrl: "http://identity-service:8080"
   usageServiceUrl: "http://usage-service:8080"
   logLevel: "error"

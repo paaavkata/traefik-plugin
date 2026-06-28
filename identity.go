@@ -38,12 +38,16 @@ func newIdentityClient(baseURL string, timeout time.Duration, log *pluginLogger)
 }
 
 // IsAdmin checks if a user has admin privileges by calling
-// GET /v1/user/:id and checking the role from identity-service.
-func (ic *IdentityClient) IsAdmin(ctx context.Context, userID string) (bool, error) {
+// GET /v1/user/:id and checking the role from identity-service. Admin is per-app
+// (guide §8.2): the cache key and the forwarded X-App-Id header are scoped by appID.
+// When appID is empty (permissive/legacy) it behaves as before.
+func (ic *IdentityClient) IsAdmin(ctx context.Context, appID, userID string) (bool, error) {
+	cacheKey := appID + "\x00" + userID
+
 	ic.mu.RLock()
-	if entry, ok := ic.adminCache[userID]; ok && time.Now().Before(entry.expiresAt) {
+	if entry, ok := ic.adminCache[cacheKey]; ok && time.Now().Before(entry.expiresAt) {
 		ic.mu.RUnlock()
-		ic.log.debugf("identity IsAdmin cache hit user_id=%s is_admin=%v", userID, entry.isAdmin)
+		ic.log.debugf("identity IsAdmin cache hit app_id=%s user_id=%s is_admin=%v", appID, userID, entry.isAdmin)
 		return entry.isAdmin, nil
 	}
 	ic.mu.RUnlock()
@@ -53,6 +57,9 @@ func (ic *IdentityClient) IsAdmin(ctx context.Context, userID string) (bool, err
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return false, err
+	}
+	if appID != "" {
+		req.Header.Set("X-App-Id", appID)
 	}
 
 	resp, err := ic.client.Do(req)
@@ -87,7 +94,7 @@ func (ic *IdentityClient) IsAdmin(ctx context.Context, userID string) (bool, err
 	}
 
 	ic.mu.Lock()
-	ic.adminCache[userID] = adminCacheEntry{
+	ic.adminCache[cacheKey] = adminCacheEntry{
 		isAdmin:   result.Data.IsAdmin,
 		expiresAt: time.Now().Add(adminCacheTTL),
 	}
@@ -121,22 +128,36 @@ func newPlanResolver(serviceServiceURL string, timeout time.Duration, log *plugi
 	}
 }
 
-// Resolve returns the plan name for a user (customer UID). Falls back to "free".
-func (pr *PlanResolver) Resolve(ctx context.Context, userID, defaultPlan string) string {
+// Resolve returns the plan name for a customer scoped to an app (guide §4/§8.3:
+// plans are per (app_id, user_id)). The cache key and request are app-scoped. When
+// appID is non-empty the per-app rate-tier endpoint is used (guide §11); when empty
+// (permissive/legacy single-app) the legacy global endpoint is used and behaviour
+// matches today's. Falls back to defaultPlan on any error.
+func (pr *PlanResolver) Resolve(ctx context.Context, appID, userID, defaultPlan string) string {
+	cacheKey := appID + "\x00" + userID
+
 	pr.mu.RLock()
-	if entry, ok := pr.cache[userID]; ok && time.Now().Before(entry.expiresAt) {
+	if entry, ok := pr.cache[cacheKey]; ok && time.Now().Before(entry.expiresAt) {
 		pr.mu.RUnlock()
-		pr.log.debugf("plan resolver cache hit user_id=%s plan=%s", userID, entry.plan)
+		pr.log.debugf("plan resolver cache hit app_id=%s user_id=%s plan=%s", appID, userID, entry.plan)
 		return entry.plan
 	}
 	pr.mu.RUnlock()
 
-	url := fmt.Sprintf("%s/v1/customers/%s/rate-tier", pr.baseURL, userID)
+	var url string
+	if appID != "" {
+		url = fmt.Sprintf("%s/v1/apps/%s/customers/%s/rate-tier", pr.baseURL, appID, userID)
+	} else {
+		url = fmt.Sprintf("%s/v1/customers/%s/rate-tier", pr.baseURL, userID)
+	}
 	start := time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		pr.log.warnf("plan resolver build request failed user_id=%s error=%v", userID, err)
+		pr.log.warnf("plan resolver build request failed app_id=%s user_id=%s error=%v", appID, userID, err)
 		return defaultPlan
+	}
+	if appID != "" {
+		req.Header.Set("X-App-Id", appID)
 	}
 
 	resp, err := pr.client.Do(req)
@@ -171,12 +192,12 @@ func (pr *PlanResolver) Resolve(ctx context.Context, userID, defaultPlan string)
 	}
 
 	pr.mu.Lock()
-	pr.cache[userID] = planCacheEntry{
+	pr.cache[cacheKey] = planCacheEntry{
 		plan:      result.PlanName,
 		expiresAt: time.Now().Add(planCacheTTL),
 	}
 	pr.mu.Unlock()
 
-	pr.log.infof("plan resolved user_id=%s plan=%s", userID, result.PlanName)
+	pr.log.infof("plan resolved app_id=%s user_id=%s plan=%s", appID, userID, result.PlanName)
 	return result.PlanName
 }

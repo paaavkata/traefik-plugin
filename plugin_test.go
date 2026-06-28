@@ -1,6 +1,7 @@
 package traefik_gateway_plugin
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -17,33 +18,38 @@ func setupTestSnapshot() *SnapshotCache {
 	}
 	sc.snapshot = &SnapshotDTO{
 		Version: "1",
-		Services: []SnapshotServiceDTO{
+		Apps: []SnapshotAppDTO{
 			{
-				UID:      "svc1",
-				Slug:     "conversion",
-				BasePath: "/api/conversion",
-				Endpoints: []SnapshotEndpointDTO{
+				AppID: "fileconvert",
+				Services: []SnapshotServiceDTO{
 					{
-						UID:         "ep1",
-						Method:      "POST",
-						Path:        "/v1/convert",
-						FullPath:    "/api/conversion/v1/convert",
-						PathRegex:   `^/api/conversion/v1/convert$`,
-						AccessLevel: "free",
-						RateLimits: map[string]RateLimitValue{
-							"free": {Requests: 10, DurationSeconds: 60},
-							"pro":  {Requests: 100, DurationSeconds: 60},
-						},
-					},
-					{
-						UID:         "ep2",
-						Method:      "GET",
-						Path:        "/v1/admin/users",
-						FullPath:    "/api/conversion/v1/admin/users",
-						PathRegex:   `^/api/conversion/v1/admin/users$`,
-						AccessLevel: "admin",
-						RateLimits: map[string]RateLimitValue{
-							"free": {Requests: 0, DurationSeconds: 60},
+						UID:      "svc1",
+						Slug:     "conversion",
+						BasePath: "/api/conversion",
+						Endpoints: []SnapshotEndpointDTO{
+							{
+								UID:         "ep1",
+								Method:      "POST",
+								Path:        "/v1/convert",
+								FullPath:    "/api/conversion/v1/convert",
+								PathRegex:   `^/api/conversion/v1/convert$`,
+								AccessLevel: "free",
+								RateLimits: map[string]RateLimitValue{
+									"free": {Requests: 10, DurationSeconds: 60},
+									"pro":  {Requests: 100, DurationSeconds: 60},
+								},
+							},
+							{
+								UID:         "ep2",
+								Method:      "GET",
+								Path:        "/v1/admin/users",
+								FullPath:    "/api/conversion/v1/admin/users",
+								PathRegex:   `^/api/conversion/v1/admin/users$`,
+								AccessLevel: "admin",
+								RateLimits: map[string]RateLimitValue{
+									"free": {Requests: 0, DurationSeconds: 60},
+								},
+							},
 						},
 					},
 				},
@@ -52,17 +58,33 @@ func setupTestSnapshot() *SnapshotCache {
 	}
 
 	compiled := make([]compiledEndpoint, 0)
-	for _, svc := range sc.snapshot.Services {
-		for _, ep := range svc.Endpoints {
-			re := compileRegex(ep.PathRegex, ep.FullPath)
-			compiled = append(compiled, compiledEndpoint{
-				SnapshotEndpointDTO: ep,
-				regex:               re,
-			})
+	for _, app := range sc.snapshot.Apps {
+		for _, svc := range app.Services {
+			for _, ep := range svc.Endpoints {
+				re := compileRegex(ep.PathRegex, ep.FullPath)
+				compiled = append(compiled, compiledEndpoint{
+					SnapshotEndpointDTO: ep,
+					AppID:               app.AppID,
+					regex:               re,
+				})
+			}
 		}
 	}
 	sc.compiled = compiled
 	return sc
+}
+
+// setupTestAppRegistry returns an AppRegistryCache pre-populated with a host→app_id
+// map, bypassing HTTP (mirrors setupTestSnapshot). loaded=true so coldStart()==false.
+func setupTestAppRegistry() *AppRegistryCache {
+	return &AppRegistryCache{
+		byHost: map[string]string{
+			"fileconvert.online": "fileconvert",
+			"cms.example.com":    "cms",
+		},
+		loaded: true,
+		stopCh: make(chan struct{}),
+	}
 }
 
 func TestPlugin_AnonymousRequest_FreeEndpoint(t *testing.T) {
@@ -482,5 +504,369 @@ func TestPlugin_AuthenticatedUser_SetsHeaders(t *testing.T) {
 	}
 	if capturedPlan != "pro" {
 		t.Errorf("expected X-User-Plan=pro, got %s", capturedPlan)
+	}
+}
+
+// ── Multi-app (host → app_id) tests ──────────────────────────────────────────────
+
+// Known host → trusted X-App-Id is stamped on the forwarded request.
+func TestPlugin_AppResolution_KnownHost_StampsHeader(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+
+	var capturedAppID string
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		capturedAppID = req.Header.Get("X-App-Id")
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	plugin := &GatewayPlugin{
+		next:        next,
+		name:        "test",
+		config:      config,
+		snapshot:    setupTestSnapshot(),
+		appRegistry: setupTestAppRegistry(),
+		identity:    newIdentityClient("http://localhost:9999", 1*time.Second, nil),
+		planResolver: &PlanResolver{
+			cache: make(map[string]planCacheEntry),
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+	req.Host = "fileconvert.online"
+	req.Header.Set("X-Session-Id", "sess-1")
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	if capturedAppID != "fileconvert" {
+		t.Errorf("expected X-App-Id=fileconvert, got %q", capturedAppID)
+	}
+}
+
+// Inbound client-supplied X-App-Id must be stripped and replaced with the trusted value.
+func TestPlugin_AppResolution_StripsInboundHeader(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+
+	var capturedAppID string
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		capturedAppID = req.Header.Get("X-App-Id")
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	plugin := &GatewayPlugin{
+		next:        next,
+		name:        "test",
+		config:      config,
+		snapshot:    setupTestSnapshot(),
+		appRegistry: setupTestAppRegistry(),
+		identity:    newIdentityClient("http://localhost:9999", 1*time.Second, nil),
+		planResolver: &PlanResolver{
+			cache: make(map[string]planCacheEntry),
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+	req.Host = "fileconvert.online"
+	req.Header.Set("X-App-Id", "evil-spoof")
+	req.Header.Set("X-Session-Id", "sess-1")
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if capturedAppID != "fileconvert" {
+		t.Errorf("expected spoofed X-App-Id replaced with fileconvert, got %q", capturedAppID)
+	}
+}
+
+// Inbound X-App-Id must be stripped even on the pass-through path (unregistered endpoint).
+func TestPlugin_AppResolution_StripsInboundHeader_PassThrough(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+
+	var seen bool
+	var capturedAppID string
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		seen = true
+		capturedAppID = req.Header.Get("X-App-Id")
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	plugin := &GatewayPlugin{
+		next:        next,
+		name:        "test",
+		config:      config,
+		snapshot:    setupTestSnapshot(),
+		appRegistry: setupTestAppRegistry(),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/unknown/path", nil)
+	req.Host = "fileconvert.online"
+	req.Header.Set("X-App-Id", "evil-spoof")
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if !seen {
+		t.Fatal("expected pass-through to next handler")
+	}
+	// Known host: trusted value stamped, spoof gone.
+	if capturedAppID != "fileconvert" {
+		t.Errorf("expected X-App-Id=fileconvert on pass-through, got %q", capturedAppID)
+	}
+}
+
+// Enforce mode + unknown host → 403.
+func TestPlugin_AppResolution_UnknownHost_Enforce_403(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+	config.AppResolutionMode = "enforce"
+
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	plugin := &GatewayPlugin{
+		next:        next,
+		name:        "test",
+		config:      config,
+		snapshot:    setupTestSnapshot(),
+		appRegistry: setupTestAppRegistry(),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+	req.Host = "not-a-known-host.com"
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for unknown host in enforce mode, got %d", rr.Code)
+	}
+}
+
+// Permissive mode + unknown host → 200, no X-App-Id stamped (legacy behaviour).
+func TestPlugin_AppResolution_UnknownHost_Permissive_200(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+	// permissive is the default
+
+	var capturedAppID string
+	var seen bool
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		seen = true
+		capturedAppID = req.Header.Get("X-App-Id")
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	plugin := &GatewayPlugin{
+		next:        next,
+		name:        "test",
+		config:      config,
+		snapshot:    setupTestSnapshot(),
+		appRegistry: setupTestAppRegistry(),
+		identity:    newIdentityClient("http://localhost:9999", 1*time.Second, nil),
+		planResolver: &PlanResolver{
+			cache: make(map[string]planCacheEntry),
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+	req.Host = "not-a-known-host.com"
+	req.Header.Set("X-Session-Id", "sess-1")
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 in permissive mode, got %d", rr.Code)
+	}
+	if !seen {
+		t.Fatal("expected request forwarded to next")
+	}
+	if capturedAppID != "" {
+		t.Errorf("expected no X-App-Id stamped for unknown host (permissive), got %q", capturedAppID)
+	}
+}
+
+// Enforce mode + cold registry (never loaded) → 503.
+func TestPlugin_AppResolution_ColdRegistry_Enforce_503(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+	config.AppResolutionMode = "enforce"
+
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	coldRegistry := &AppRegistryCache{
+		byHost: map[string]string{},
+		loaded: false, // never refreshed successfully
+		stopCh: make(chan struct{}),
+	}
+
+	plugin := &GatewayPlugin{
+		next:        next,
+		name:        "test",
+		config:      config,
+		snapshot:    setupTestSnapshot(),
+		appRegistry: coldRegistry,
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+	req.Host = "fileconvert.online"
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 for cold registry in enforce mode, got %d", rr.Code)
+	}
+}
+
+// Disabled mode → no resolution, no stamp, but inbound copy still stripped.
+func TestPlugin_AppResolution_Disabled_StripsButNoStamp(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+	config.AppResolutionMode = "disabled"
+
+	var capturedAppID string
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		capturedAppID = req.Header.Get("X-App-Id")
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	plugin := &GatewayPlugin{
+		next:        next,
+		name:        "test",
+		config:      config,
+		snapshot:    setupTestSnapshot(),
+		appRegistry: setupTestAppRegistry(),
+		identity:    newIdentityClient("http://localhost:9999", 1*time.Second, nil),
+		planResolver: &PlanResolver{
+			cache: make(map[string]planCacheEntry),
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+	req.Host = "fileconvert.online"
+	req.Header.Set("X-App-Id", "evil-spoof")
+	req.Header.Set("X-Session-Id", "sess-1")
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if capturedAppID != "" {
+		t.Errorf("expected no X-App-Id in disabled mode (inbound stripped, none stamped), got %q", capturedAppID)
+	}
+}
+
+// Per-app endpoint match: an app-scoped endpoint wins over a shared one with the same path.
+func TestPlugin_PerAppEndpoint_ExactMatchPreferred(t *testing.T) {
+	sc := &SnapshotCache{stopCh: make(chan struct{})}
+	// matchEndpoint operates on the compiled set; build it directly to unit-test the
+	// two-pass match (exact-app preferred over a shared "" fallback). service-service's
+	// apps[] snapshot emits concrete app_ids (shared services are duplicated per app),
+	// so "" here models only the plugin's defensive fallback path.
+	sc.compiled = []compiledEndpoint{
+		{
+			SnapshotEndpointDTO: SnapshotEndpointDTO{
+				UID: "shared-ep", Method: "GET", Path: "/v1/thing",
+				FullPath: "/api/x/v1/thing", PathRegex: `^/api/x/v1/thing$`, AccessLevel: "free",
+			},
+			AppID: "", // shared/global fallback
+			regex: compileRegex(`^/api/x/v1/thing$`, "/api/x/v1/thing"),
+		},
+		{
+			SnapshotEndpointDTO: SnapshotEndpointDTO{
+				UID: "fc-ep", Method: "GET", Path: "/v1/thing",
+				FullPath: "/api/x/v1/thing", PathRegex: `^/api/x/v1/thing$`, AccessLevel: "admin",
+			},
+			AppID: "fileconvert", // app-specific override
+			regex: compileRegex(`^/api/x/v1/thing$`, "/api/x/v1/thing"),
+		},
+	}
+
+	if ep := sc.matchEndpoint("fileconvert", "GET", "/api/x/v1/thing"); ep == nil || ep.UID != "fc-ep" {
+		t.Errorf("expected exact-app endpoint fc-ep, got %+v", ep)
+	}
+	if ep := sc.matchEndpoint("cms", "GET", "/api/x/v1/thing"); ep == nil || ep.UID != "shared-ep" {
+		t.Errorf("expected shared endpoint for other app, got %+v", ep)
+	}
+	if ep := sc.matchEndpoint("", "GET", "/api/x/v1/thing"); ep == nil || ep.UID != "shared-ep" {
+		t.Errorf("expected shared endpoint for empty appID, got %+v", ep)
+	}
+}
+
+// Per-app plan resolution: the same user on two apps must not share a cached plan.
+func TestPlanResolver_AppScopedCache(t *testing.T) {
+	var requestedURLs []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestedURLs = append(requestedURLs, r.URL.Path)
+		plan := "free"
+		if r.URL.Path == "/v1/apps/fileconvert/customers/42/rate-tier" {
+			plan = "pro"
+		}
+		json.NewEncoder(w).Encode(map[string]string{"plan_name": plan})
+	}))
+	defer server.Close()
+
+	pr := newPlanResolver(server.URL, 5*time.Second, nil)
+
+	if got := pr.Resolve(context.Background(), "fileconvert", "42", "free"); got != "pro" {
+		t.Errorf("expected pro for fileconvert/42, got %q", got)
+	}
+	if got := pr.Resolve(context.Background(), "cms", "42", "free"); got != "free" {
+		t.Errorf("expected free for cms/42 (separate cache key), got %q", got)
+	}
+	if len(requestedURLs) != 2 {
+		t.Errorf("expected 2 upstream calls (no cross-app cache hit), got %d: %v", len(requestedURLs), requestedURLs)
+	}
+}
+
+// Preflight from an unknown host still returns 204 with ACAO — CORS precedes resolution.
+func TestPlugin_CORS_Preflight_UnknownHost_Enforce(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+	config.AppResolutionMode = "enforce"
+	config.CORSAllowedOrigins = []string{"https://file-convert.online"}
+
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	plugin := &GatewayPlugin{
+		next:        next,
+		name:        "test",
+		config:      config,
+		snapshot:    setupTestSnapshot(),
+		appRegistry: setupTestAppRegistry(),
+	}
+
+	req := httptest.NewRequest(http.MethodOptions, "/api/conversion/v1/convert", nil)
+	req.Host = "totally-unknown.example"
+	req.Header.Set("Origin", "https://file-convert.online")
+	req.Header.Set("Access-Control-Request-Method", "POST")
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Errorf("expected 204 preflight even from unknown host, got %d", rr.Code)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://file-convert.online" {
+		t.Errorf("expected ACAO on preflight, got %q", got)
 	}
 }

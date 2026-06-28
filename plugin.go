@@ -17,6 +17,7 @@ type GatewayPlugin struct {
 	log    *pluginLogger
 
 	snapshot     *SnapshotCache
+	appRegistry  *AppRegistryCache
 	rateLimiter  *RateLimiter
 	identity     *IdentityClient
 	planResolver *PlanResolver
@@ -31,6 +32,8 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	httpTimeout := parseDuration(config.HTTPTimeout, 5*time.Second)
 	refreshInterval := parseDuration(config.SnapshotRefreshInterval, 30*time.Second)
 	pollInterval := parseDuration(config.SnapshotVersionPollInterval, 5*time.Second)
+	appRefreshInterval := parseDuration(config.AppSnapshotRefreshInterval, 30*time.Second)
+	appPollInterval := parseDuration(config.AppSnapshotVersionPollInterval, 5*time.Second)
 
 	plog := newPluginLogger(config.LogLevel)
 
@@ -45,6 +48,12 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	// middleware (and Traefik's per-reload rebuilds) reuse a single poller instead of
 	// each spawning its own and flooding service-service.
 	plugin.snapshot = getSharedSnapshotCache(config.ServiceServiceURL, httpTimeout, refreshInterval, pollInterval, plog)
+
+	// Host→app_id registry cache — also shared process-wide for the same reason as the
+	// endpoint snapshot. Started even in "disabled" mode is unnecessary, so skip it then.
+	if config.AppResolutionMode != "disabled" {
+		plugin.appRegistry = getSharedAppRegistryCache(config.ApplicationServiceURL, httpTimeout, appRefreshInterval, appPollInterval, plog)
+	}
 
 	// Rate limiter (Redis)
 	if !config.DisableRateLimit {
@@ -111,8 +120,41 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	// 1. Match the request against the registry snapshot
-	ep := p.snapshot.matchEndpoint(req.Method, req.URL.Path)
+	// 1a. Resolve app_id from the request host; strip any inbound client copy of the
+	// trusted header (earliest & unconditional — spoof-proof on every path, same
+	// principle as the session Del below); stamp the trusted header on success.
+	req.Header.Del(p.config.AppIDHeader)
+	var appID string
+	if p.config.AppResolutionMode != "disabled" && p.appRegistry != nil {
+		host := p.resolutionHost(req)
+		id, known := p.appRegistry.resolveHost(host)
+		switch {
+		case known:
+			appID = id
+			req.Header.Set(p.config.AppIDHeader, appID)
+			p.log.debugf("app resolved host=%q app_id=%s", host, appID)
+		case p.config.AppResolutionMode == "enforce":
+			if p.appRegistry.coldStart() {
+				p.log.errorf("app registry unavailable (cold) host=%q path=%s (enforce)", host, req.URL.Path)
+				writeJSON(rw, http.StatusServiceUnavailable, map[string]string{
+					"error":   "registry_unavailable",
+					"message": "application registry is not ready",
+				})
+				return
+			}
+			p.log.warnf("unknown/inactive app host=%q path=%s rejected (enforce)", host, req.URL.Path)
+			writeJSON(rw, http.StatusForbidden, map[string]string{
+				"error":   "unknown_app",
+				"message": "host is not mapped to an active application",
+			})
+			return
+		default: // permissive
+			p.log.warnf("TODO(trust): unmapped host=%q served without app_id (permissive)", host)
+		}
+	}
+
+	// 1. Match the request against the registry snapshot (scoped to the resolved app)
+	ep := p.snapshot.matchEndpoint(appID, req.Method, req.URL.Path)
 	if ep == nil {
 		// Endpoint not registered — pass through (or deny depending on policy).
 		// Default: pass through to let Traefik's own routing handle 404.
@@ -159,7 +201,7 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			})
 			return
 		}
-		isAdmin, err := p.identity.IsAdmin(ctx, claims.UserID)
+		isAdmin, err := p.identity.IsAdmin(ctx, appID, claims.UserID)
 		if err != nil {
 			p.log.warnf("identity admin check failed user_id=%s error=%v", claims.UserID, err)
 		}
@@ -182,8 +224,8 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	var planName string
 
 	if claims != nil {
-		rateLimitKey = "user:" + claims.UserID
-		planName = p.planResolver.Resolve(ctx, claims.UserID, p.config.DefaultPlanName)
+		rateLimitKey = "app:" + appID + "|user:" + claims.UserID
+		planName = p.planResolver.Resolve(ctx, appID, claims.UserID, p.config.DefaultPlanName)
 		req.Header.Set(p.config.UserIDHeader, claims.UserID)
 		req.Header.Set(p.config.UserPlanHeader, planName)
 		// Remove any client-supplied session header so backends can trust X-User-Id alone.
@@ -199,7 +241,7 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		if deviceID != "" {
 			req.Header.Set(p.config.DeviceIDHeader, deviceID)
 		}
-		rateLimitKey = anonymousRateLimitKey(deviceID, sessionID, clientIP(req))
+		rateLimitKey = "app:" + appID + "|" + anonymousRateLimitKey(deviceID, sessionID, clientIP(req))
 		planName = p.config.DefaultPlanName
 	}
 
@@ -233,6 +275,23 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	// 6. Forward to next handler
 	p.next.ServeHTTP(rw, req)
+}
+
+// resolutionHost returns the host used for app resolution. The prod path is
+// CloudFlare→nginx→Traefik; whether the original Host survives or arrives as
+// X-Forwarded-Host is unconfirmed, so the source is a config toggle defaulting to the
+// safe req.Host. When TrustForwardedHost is set, X-Forwarded-Host wins if present.
+func (p *GatewayPlugin) resolutionHost(req *http.Request) string {
+	if p.config.TrustForwardedHost {
+		if h := req.Header.Get("X-Forwarded-Host"); h != "" {
+			// X-Forwarded-Host may be a comma-separated list; take the first (origin).
+			if i := strings.IndexByte(h, ','); i >= 0 {
+				h = h[:i]
+			}
+			return strings.TrimSpace(h)
+		}
+	}
+	return req.Host
 }
 
 // resolveRateLimit determines the rate limit for the endpoint + plan combination.

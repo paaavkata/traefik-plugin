@@ -20,6 +20,18 @@ spec:
       serviceServiceUrl: "http://service-service.fc-dev"
       snapshotRefreshInterval: "30s"
       snapshotVersionPollInterval: "5s"
+      # Application-service registry (host→app_id). The gateway derives the trusted
+      # X-App-Id from the request host and strips any inbound client copy.
+      applicationServiceUrl: "http://application-service.fc-dev"
+      appSnapshotRefreshInterval: "30s"
+      appSnapshotVersionPollInterval: "5s"
+      appIdHeader: "X-App-Id"
+      # Start safe with "permissive" (unknown host → pass through, no app_id stamped);
+      # flip to "enforce" once application-service is live (unknown/inactive host → 403).
+      appResolutionMode: "permissive"
+      # Prod path is CloudFlare→nginx→Traefik; unconfirmed whether the original Host
+      # survives or arrives as X-Forwarded-Host. Default false (resolve from req.Host).
+      trustForwardedHost: false
       identityServiceUrl: "http://identity-service.fc-dev"
       usageServiceUrl: "http://usage-service.fc-dev"
       defaultRateLimitRequests: 30
@@ -66,5 +78,6 @@ spec:
         - "Authorization"
         - "X-Session-Id"
         - "X-Device-Id"
+        - "X-App-Id"
       corsAllowCredentials: true
       corsMaxAge: 3600

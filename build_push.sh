@@ -28,3 +28,5 @@ docker buildx build \
     -t ${REGISTRY}/${REPO_PREFIX}/${APP_NAME}:${TAG} \
     -f Dockerfile \
     .
+
+echo "Replace the tag in the /storage/WorkspaceFileConvert/k8s_live_infra/AWS/eu-west-1/infra/ingress/traefik/values.yaml file with ${TAG}"

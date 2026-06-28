@@ -26,6 +26,27 @@ type Config struct {
 	SnapshotRefreshInterval     string `json:"snapshotRefreshInterval" yaml:"snapshotRefreshInterval"`
 	SnapshotVersionPollInterval string `json:"snapshotVersionPollInterval" yaml:"snapshotVersionPollInterval"`
 
+	// Application-service (host→app_id registry snapshot)
+	ApplicationServiceURL          string `json:"applicationServiceUrl" yaml:"applicationServiceUrl"`
+	AppSnapshotRefreshInterval     string `json:"appSnapshotRefreshInterval" yaml:"appSnapshotRefreshInterval"`
+	AppSnapshotVersionPollInterval string `json:"appSnapshotVersionPollInterval" yaml:"appSnapshotVersionPollInterval"`
+
+	// AppIDHeader is the trusted, gateway-stamped header carrying the resolved app_id.
+	// Canonical spelling is "X-App-Id" (guide §10). Any inbound client copy is stripped.
+	AppIDHeader string `json:"appIdHeader" yaml:"appIdHeader"`
+
+	// AppResolutionMode controls host→app_id resolution behaviour:
+	//   "enforce"    — unknown/inactive host ⇒ 403, cold registry ⇒ 503.
+	//   "permissive" — unknown host ⇒ pass through without app_id (logs TODO(trust)).
+	//   "disabled"   — skip host resolution entirely (local/debug, legacy single-app).
+	AppResolutionMode string `json:"appResolutionMode" yaml:"appResolutionMode"`
+
+	// TrustForwardedHost selects the host source for app resolution. When true, the
+	// X-Forwarded-Host header is used (when present); otherwise req.Host. Default false.
+	// The prod path is CloudFlare→nginx→Traefik and it is not yet confirmed whether the
+	// original Host survives, so this is a flag defaulting to the safe req.Host.
+	TrustForwardedHost bool `json:"trustForwardedHost" yaml:"trustForwardedHost"`
+
 	// Identity-service
 	IdentityServiceURL string `json:"identityServiceUrl" yaml:"identityServiceUrl"`
 
@@ -80,10 +101,15 @@ func CreateConfig() *Config {
 		ServiceServiceURL:               "http://service-service:8080",
 		SnapshotRefreshInterval:         "30s",
 		SnapshotVersionPollInterval:     "5s",
+		ApplicationServiceURL:           "http://application-service:8080",
+		AppSnapshotRefreshInterval:      "30s",
+		AppSnapshotVersionPollInterval:  "5s",
+		AppIDHeader:                     "X-App-Id",
+		AppResolutionMode:               "permissive",
 		IdentityServiceURL:              "http://identity-service:8080",
 		UsageServiceURL:                 "http://usage-service:8080",
 		CORSAllowedMethods:              []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		CORSAllowedHeaders:              []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Session-Id", "X-Device-Id"},
+		CORSAllowedHeaders:              []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Session-Id", "X-Device-Id", "X-App-Id"},
 		CORSAllowCredentials:            true,
 		CORSMaxAge:                      3600,
 		DefaultRateLimitRequests:        30,

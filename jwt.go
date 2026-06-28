@@ -10,8 +10,12 @@ import (
 
 // TokenClaims holds the decoded JWT fields relevant to this plugin.
 type TokenClaims struct {
-	UserID    string
-	Issuer    string
+	UserID string
+	Issuer string
+	// AppID is the optional "app_id" claim (guide §8.5). The gateway enforces that a
+	// token minted for one app is not replayed against another. Empty for legacy
+	// tokens issued before the claim existed (allowed during rollout).
+	AppID     string
 	ExpiresAt time.Time
 }
 

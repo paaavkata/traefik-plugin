@@ -1,4 +1,4 @@
-FROM golang:1.22 AS vendor
+FROM golang:1.26.4 AS vendor
 
 WORKDIR /plugin
 

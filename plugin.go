@@ -120,10 +120,19 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	// 1a. Resolve app_id from the request host; strip any inbound client copy of the
-	// trusted header (earliest & unconditional — spoof-proof on every path, same
-	// principle as the session Del below); stamp the trusted header on success.
+	// Strip ALL gateway-owned trust headers unconditionally at entry. These are stamped
+	// by THIS plugin only from validated data; any inbound client copy is a spoof and
+	// must never survive to the backend on any path (passthrough, matched, error). The
+	// only way any of these reaches a backend is if the plugin re-stamps a validated
+	// value in a later step. (X-Session-Id / X-Device-Id are client-supplied identity
+	// used for anonymous rate-limiting and are handled separately below — not blanket-
+	// deleted here.)
 	req.Header.Del(p.config.AppIDHeader)
+	req.Header.Del(p.config.UserIDHeader)
+	req.Header.Del(p.config.UserPlanHeader)
+	req.Header.Del(p.config.IsAdminHeader)
+
+	// 1a. Resolve app_id from the request host; stamp the trusted header on success.
 	var appID string
 	if p.config.AppResolutionMode != "disabled" && p.appRegistry != nil {
 		host := p.resolutionHost(req)

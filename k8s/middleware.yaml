@@ -1,0 +1,84 @@
+# Traefik Middleware CRD for the gateway plugin.
+# Apply this in the same namespace as Traefik or reference cross-namespace.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: traefik-gateway-plugin
+  namespace: fc-dev
+spec:
+  plugin:
+    gateway:
+      jwtSecret: "22LWtG2qr9I0EtNtrb8fzEWmlqRTiw1k7X82A1H6BJc="
+      jwtIssuer: "file-convert.online"
+      jwtHeaderKey: "Authorization"
+      sessionIdHeader: "X-Session-Id"
+      deviceIdHeader: "X-Device-Id"
+      redisUrl: "redis://redis-master.fc-infra-dev:6379/0"
+      redisPassword: ""
+      redisDb: 0
+      redisPrefix: "gw:rl:"
+      serviceServiceUrl: "http://service-service.fc-dev"
+      snapshotRefreshInterval: "30s"
+      snapshotVersionPollInterval: "5s"
+      # Application-service registry (host→app_id). The gateway derives the trusted
+      # X-App-Id from the request host and strips any inbound client copy.
+      applicationServiceUrl: "http://application-service.fc-dev"
+      appSnapshotRefreshInterval: "30s"
+      appSnapshotVersionPollInterval: "5s"
+      appIdHeader: "X-App-Id"
+      # "enforce": there are NO endpoints allowed without a resolved app_id. Unknown/
+      # inactive host → 403 (unknown_app); cold registry → 503. No request reaches the
+      # backend without a host-resolved X-App-Id. ("permissive"/"disabled" are local/debug only.)
+      appResolutionMode: "enforce"
+      # Prod path is CloudFlare→nginx→Traefik; unconfirmed whether the original Host
+      # survives or arrives as X-Forwarded-Host. Default false (resolve from req.Host).
+      trustForwardedHost: false
+      identityServiceUrl: "http://identity-service.fc-dev"
+      usageServiceUrl: "http://usage-service.fc-dev"
+      defaultRateLimitRequests: 30
+      defaultRateLimitDurationSeconds: 60
+      defaultPlanName: "free"
+      adminAccessLevel: "admin"
+      freeAccessLevel: "free"
+      userIdHeader: "X-User-Id"
+      userPlanHeader: "X-User-Plan"
+      isAdminHeader: "X-Is-Admin"
+      httpTimeout: "5s"
+      disableRateLimit: false
+      disableAuth: false
+      logLevel: "info"
+      # CORS — handled centrally by the plugin so that auth/rate-limit error
+      # responses (401, 403, 429) also carry the correct ACAO header.
+      # The apex domain and the wildcard pattern cover all subdomains
+      # (admin., dev., audio., video., image., document., ebook., archive.).
+      corsAllowedOrigins:
+        - "https://dev.file-convert.online"
+        - "https://admin.dev.file-convert.online"
+        # Dev/local convenience — remove in a production-only middleware manifest.
+        - "http://localhost:3000"
+        - "http://localhost:3001"
+        - "http://localhost:5173"
+        - "http://localhost:4200"
+        - "http://localhost:8080"
+        - "http://127.0.0.1:3000"
+        - "http://127.0.0.1:3001"
+        - "http://127.0.0.1:5173"
+        - "http://127.0.0.1:4200"
+        - "http://127.0.0.1:8080"
+      corsAllowedMethods:
+        - "GET"
+        - "POST"
+        - "PUT"
+        - "PATCH"
+        - "DELETE"
+        - "OPTIONS"
+      corsAllowedHeaders:
+        - "Origin"
+        - "Content-Type"
+        - "Accept"
+        - "Authorization"
+        - "X-Session-Id"
+        - "X-Device-Id"
+        - "X-App-Id"
+      corsAllowCredentials: true
+      corsMaxAge: 3600

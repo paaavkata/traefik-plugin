@@ -35,10 +35,16 @@ type Config struct {
 	// Canonical spelling is "X-App-Id" (guide §10). Any inbound client copy is stripped.
 	AppIDHeader string `json:"appIdHeader" yaml:"appIdHeader"`
 
-	// AppResolutionMode controls host→app_id resolution behaviour:
-	//   "enforce"    — unknown/inactive host ⇒ 403, cold registry ⇒ 503.
-	//   "permissive" — unknown host ⇒ pass through without app_id (logs TODO(trust)).
-	//   "disabled"   — skip host resolution entirely (local/debug, legacy single-app).
+	// AppResolutionMode controls host→app_id resolution behaviour. There are NO
+	// endpoints allowed without a resolved app_id, so "enforce" is the default/prod
+	// path. Modes:
+	//   "enforce"    — (DEFAULT) unknown/inactive host ⇒ 403, cold registry ⇒ 503.
+	//                  A request with no resolvable app_id never reaches endpoint
+	//                  matching or the backend.
+	//   "permissive" — unknown host ⇒ pass through without app_id. LOCAL/DEBUG ONLY;
+	//                  do not use in production (it lets requests through with no app_id).
+	//   "disabled"   — skip host resolution entirely. LOCAL single-app dev only; the
+	//                  app_id requirement is skipped and no X-App-Id is stamped.
 	AppResolutionMode string `json:"appResolutionMode" yaml:"appResolutionMode"`
 
 	// TrustForwardedHost selects the host source for app resolution. When true, the
@@ -105,7 +111,7 @@ func CreateConfig() *Config {
 		AppSnapshotRefreshInterval:      "30s",
 		AppSnapshotVersionPollInterval:  "5s",
 		AppIDHeader:                     "X-App-Id",
-		AppResolutionMode:               "permissive",
+		AppResolutionMode:               "enforce",
 		IdentityServiceURL:              "http://identity-service:8080",
 		UsageServiceURL:                 "http://usage-service:8080",
 		CORSAllowedMethods:              []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},

@@ -658,7 +658,7 @@ func TestPlugin_AppResolution_UnknownHost_Permissive_200(t *testing.T) {
 	config := CreateConfig()
 	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
-	// permissive is the default
+	config.AppResolutionMode = "permissive" // local/debug-only mode (no longer the default)
 
 	var capturedAppID string
 	var seen bool
@@ -832,6 +832,214 @@ func TestPlanResolver_AppScopedCache(t *testing.T) {
 	}
 	if len(requestedURLs) != 2 {
 		t.Errorf("expected 2 upstream calls (no cross-app cache hit), got %d: %v", len(requestedURLs), requestedURLs)
+	}
+}
+
+// ── Trust-header spoof stripping ─────────────────────────────────────────────────
+
+// Client-supplied trust headers (X-User-Id, X-User-Plan, X-Is-Admin) must be stripped
+// at entry and never forwarded on an anonymous request (nothing re-stamps them).
+func TestPlugin_StripsSpoofedTrustHeaders_Anonymous(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+	config.AppResolutionMode = "disabled"
+
+	var gotUserID, gotPlan, gotIsAdmin, gotAppID string
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		gotUserID = req.Header.Get("X-User-Id")
+		gotPlan = req.Header.Get("X-User-Plan")
+		gotIsAdmin = req.Header.Get("X-Is-Admin")
+		gotAppID = req.Header.Get("X-App-Id")
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	plugin := &GatewayPlugin{
+		next:     next,
+		name:     "test",
+		config:   config,
+		snapshot: setupTestSnapshot(),
+		identity: newIdentityClient("http://localhost:9999", 1*time.Second, nil),
+		planResolver: &PlanResolver{
+			cache: make(map[string]planCacheEntry),
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+	req.Header.Set("X-Session-Id", "sess-1")
+	req.Header.Set("X-User-Id", "evil-spoof")
+	req.Header.Set("X-User-Plan", "evil-spoof")
+	req.Header.Set("X-Is-Admin", "true")
+	req.Header.Set("X-App-Id", "evil-spoof")
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	if gotUserID != "" {
+		t.Errorf("expected spoofed X-User-Id stripped, got %q", gotUserID)
+	}
+	if gotPlan != "" {
+		t.Errorf("expected spoofed X-User-Plan stripped, got %q", gotPlan)
+	}
+	if gotIsAdmin != "" {
+		t.Errorf("expected spoofed X-Is-Admin stripped, got %q", gotIsAdmin)
+	}
+	if gotAppID != "" {
+		t.Errorf("expected spoofed X-App-Id stripped (disabled mode), got %q", gotAppID)
+	}
+}
+
+// Spoofed trust headers must be stripped even on the pass-through (unmatched endpoint)
+// path — the backend must never see a client-injected X-User-Id / X-Is-Admin.
+func TestPlugin_StripsSpoofedTrustHeaders_PassThrough(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+	config.AppResolutionMode = "disabled"
+
+	var gotUserID, gotPlan, gotIsAdmin string
+	var seen bool
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		seen = true
+		gotUserID = req.Header.Get("X-User-Id")
+		gotPlan = req.Header.Get("X-User-Plan")
+		gotIsAdmin = req.Header.Get("X-Is-Admin")
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	plugin := &GatewayPlugin{
+		next:     next,
+		name:     "test",
+		config:   config,
+		snapshot: setupTestSnapshot(),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/unknown/path", nil)
+	req.Header.Set("X-User-Id", "evil-spoof")
+	req.Header.Set("X-User-Plan", "evil-spoof")
+	req.Header.Set("X-Is-Admin", "true")
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if !seen {
+		t.Fatal("expected pass-through to next handler")
+	}
+	if gotUserID != "" || gotPlan != "" || gotIsAdmin != "" {
+		t.Errorf("expected all spoofed trust headers stripped on pass-through, got user=%q plan=%q admin=%q", gotUserID, gotPlan, gotIsAdmin)
+	}
+}
+
+// A spoofed X-Is-Admin on a non-admin matched endpoint (authenticated user) must be
+// cleared — only an admin grant re-stamps it.
+func TestPlugin_StripsSpoofedIsAdmin_AuthenticatedNonAdminEndpoint(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+	config.AppResolutionMode = "disabled"
+
+	var gotIsAdmin string
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		gotIsAdmin = req.Header.Get("X-Is-Admin")
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	serviceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"plan_name": "free"})
+	}))
+	defer serviceServer.Close()
+
+	plugin := &GatewayPlugin{
+		next:         next,
+		name:         "test",
+		config:       config,
+		snapshot:     setupTestSnapshot(),
+		identity:     newIdentityClient("http://localhost:9999", 1*time.Second, nil),
+		planResolver: newPlanResolver(serviceServer.URL, 5*time.Second, nil),
+	}
+
+	token := createTestToken("test-secret", 7, "file-convert.online", time.Now().Add(time.Hour))
+	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-Is-Admin", "true") // spoof
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if gotIsAdmin != "" {
+		t.Errorf("expected spoofed X-Is-Admin cleared on non-admin endpoint, got %q", gotIsAdmin)
+	}
+}
+
+// Unknown host in enforce mode → 403 and the request is NEVER forwarded.
+func TestPlugin_UnknownHost_Enforce_NotForwarded(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+	config.AppResolutionMode = "enforce"
+
+	var forwarded bool
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		forwarded = true
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	plugin := &GatewayPlugin{
+		next:        next,
+		name:        "test",
+		config:      config,
+		snapshot:    setupTestSnapshot(),
+		appRegistry: setupTestAppRegistry(),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+	req.Host = "not-a-known-host.com"
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for unknown host in enforce mode, got %d", rr.Code)
+	}
+	if forwarded {
+		t.Error("expected request NOT forwarded to backend on unknown host (enforce)")
+	}
+}
+
+// Unauthenticated request to an admin endpoint → 401 and NOT forwarded.
+func TestPlugin_AdminEndpoint_NoAuth_NotForwarded(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+	config.AppResolutionMode = "disabled"
+
+	var forwarded bool
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		forwarded = true
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	plugin := &GatewayPlugin{
+		next:     next,
+		name:     "test",
+		config:   config,
+		snapshot: setupTestSnapshot(),
+		identity: newIdentityClient("http://localhost:9999", 1*time.Second, nil),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/conversion/v1/admin/users", nil)
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for admin endpoint without auth, got %d", rr.Code)
+	}
+	if forwarded {
+		t.Error("expected unauthenticated admin request NOT forwarded to backend")
 	}
 }
 

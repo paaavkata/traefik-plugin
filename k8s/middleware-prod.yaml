@@ -3,7 +3,7 @@
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
-  name: traefik-gateway-plugin
+  name: traefik-gateway-plugin-prod
   namespace: fc-dev
 spec:
   plugin:
@@ -26,9 +26,10 @@ spec:
       appSnapshotRefreshInterval: "30s"
       appSnapshotVersionPollInterval: "5s"
       appIdHeader: "X-App-Id"
-      # Start safe with "permissive" (unknown host → pass through, no app_id stamped);
-      # flip to "enforce" once application-service is live (unknown/inactive host → 403).
-      appResolutionMode: "permissive"
+      # "enforce": there are NO endpoints allowed without a resolved app_id. Unknown/
+      # inactive host → 403 (unknown_app); cold registry → 503. No request reaches the
+      # backend without a host-resolved X-App-Id. ("permissive"/"disabled" are local/debug only.)
+      appResolutionMode: "enforce"
       # Prod path is CloudFlare→nginx→Traefik; unconfirmed whether the original Host
       # survives or arrives as X-Forwarded-Host. Default false (resolve from req.Host).
       trustForwardedHost: false

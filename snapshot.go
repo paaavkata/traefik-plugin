@@ -36,14 +36,17 @@ type SnapshotServiceDTO struct {
 }
 
 type SnapshotEndpointDTO struct {
-	UID         string                    `json:"uid"`
-	Method      string                    `json:"method"`
-	Path        string                    `json:"path"`
-	FullPath    string                    `json:"full_path"`
-	PathRegex   string                    `json:"path_regex"`
-	AccessLevel string                    `json:"access_level"`
-	Tags        []string                  `json:"tags"`
-	RateLimits  map[string]RateLimitValue `json:"rate_limits"`
+	UID         string `json:"uid"`
+	Method      string `json:"method"`
+	Path        string `json:"path"`
+	FullPath    string `json:"full_path"`
+	PathRegex   string `json:"path_regex"`
+	AccessLevel string `json:"access_level"`
+	// RequiredPermission is the RBAC v2 permission tag callers must hold
+	// (empty = none). The admin access level implies config.AdminPermission.
+	RequiredPermission string                    `json:"required_permission"`
+	Tags               []string                  `json:"tags"`
+	RateLimits         map[string]RateLimitValue `json:"rate_limits"`
 }
 
 type RateLimitValue struct {

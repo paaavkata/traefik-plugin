@@ -16,9 +16,10 @@ type IdentityClient struct {
 	client  *http.Client
 	log     *pluginLogger
 
-	// Cache admin status to avoid repeated calls per request burst.
+	// Cache admin status / authz to avoid repeated calls per request burst.
 	mu         sync.RWMutex
 	adminCache map[string]adminCacheEntry
+	authzCache map[string]authzCacheEntry
 }
 
 type adminCacheEntry struct {
@@ -26,7 +27,34 @@ type adminCacheEntry struct {
 	expiresAt time.Time
 }
 
+// UserAuthz is the per-app authorization view returned by identity's
+// GET /v1/user/{id}/authz (RBAC v2, PERMISSIONS_STRATEGY.md).
+type UserAuthz struct {
+	Roles       []string `json:"roles"`
+	Permissions []string `json:"permissions"`
+	IsAdmin     bool     `json:"is_admin"`
+}
+
+// Has reports whether the permission set grants the given tag ("*" = all).
+func (a *UserAuthz) Has(permission string) bool {
+	if a == nil {
+		return false
+	}
+	for _, p := range a.Permissions {
+		if p == "*" || p == permission {
+			return true
+		}
+	}
+	return false
+}
+
+type authzCacheEntry struct {
+	authz     *UserAuthz
+	expiresAt time.Time
+}
+
 const adminCacheTTL = 60 * time.Second
+const authzCacheTTL = 60 * time.Second
 
 func newIdentityClient(baseURL string, timeout time.Duration, log *pluginLogger) *IdentityClient {
 	return &IdentityClient{
@@ -34,7 +62,92 @@ func newIdentityClient(baseURL string, timeout time.Duration, log *pluginLogger)
 		client:     &http.Client{Timeout: timeout},
 		log:        log,
 		adminCache: make(map[string]adminCacheEntry),
+		authzCache: make(map[string]authzCacheEntry),
 	}
+}
+
+// Authz resolves the user's per-app roles and permissions from
+// GET /v1/user/:id/authz, caching per (appID, userID). If the endpoint is
+// unavailable (older identity-service deploy or transient error) it falls back
+// to the legacy admin-status check: admins synthesize a wildcard permission
+// set, non-admins an empty one — preserving pre-RBAC behavior during rollout.
+func (ic *IdentityClient) Authz(ctx context.Context, appID, userID string) (*UserAuthz, error) {
+	cacheKey := appID + "\x00" + userID
+
+	ic.mu.RLock()
+	if entry, ok := ic.authzCache[cacheKey]; ok && time.Now().Before(entry.expiresAt) {
+		ic.mu.RUnlock()
+		ic.log.debugf("identity Authz cache hit app_id=%s user_id=%s roles=%v", appID, userID, entry.authz.Roles)
+		return entry.authz, nil
+	}
+	ic.mu.RUnlock()
+
+	url := fmt.Sprintf("%s/v1/user/%s/authz", ic.baseURL, userID)
+	start := time.Now()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if appID != "" {
+		req.Header.Set("X-App-Id", appID)
+	}
+
+	authz, err := ic.fetchAuthz(req, userID, start)
+	if err != nil {
+		ic.log.warnf("identity authz unavailable, falling back to admin-status user_id=%s error=%v", userID, err)
+		isAdmin, adminErr := ic.IsAdmin(ctx, appID, userID)
+		if adminErr != nil {
+			return nil, fmt.Errorf("authz fallback failed: %w", adminErr)
+		}
+		authz = &UserAuthz{Roles: []string{}, Permissions: []string{}, IsAdmin: isAdmin}
+		if isAdmin {
+			authz.Permissions = []string{"*"}
+		}
+	}
+
+	ic.mu.Lock()
+	ic.authzCache[cacheKey] = authzCacheEntry{authz: authz, expiresAt: time.Now().Add(authzCacheTTL)}
+	ic.mu.Unlock()
+	return authz, nil
+}
+
+func (ic *IdentityClient) fetchAuthz(req *http.Request, userID string, start time.Time) (*UserAuthz, error) {
+	resp, err := ic.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("identity-service call failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	dur := since(start)
+	if err != nil {
+		return nil, err
+	}
+	ic.log.debugf("identity authz response user_id=%s status=%d duration=%s body=%s", userID, resp.StatusCode, dur, truncateForLog(string(body), maxLoggedHTTPBody))
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("identity-service returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Status string    `json:"status"`
+		Data   UserAuthz `json:"data"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	if result.Data.Roles == nil {
+		result.Data.Roles = []string{}
+	}
+	if result.Data.Permissions == nil {
+		result.Data.Permissions = []string{}
+	}
+	// Admins keep legacy full access even if their role's policy links are
+	// incomplete (is_admin derives from the Owner/Admin role name).
+	if result.Data.IsAdmin && !result.Data.Has("*") {
+		result.Data.Permissions = append(result.Data.Permissions, "*")
+	}
+	return &result.Data, nil
 }
 
 // IsAdmin checks if a user has admin privileges by calling

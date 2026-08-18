@@ -131,6 +131,7 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	req.Header.Del(p.config.UserIDHeader)
 	req.Header.Del(p.config.UserPlanHeader)
 	req.Header.Del(p.config.IsAdminHeader)
+	req.Header.Del(p.config.UserRolesHeader)
 
 	// 1a. Resolve app_id from the request host; stamp the trusted header on success.
 	var appID string
@@ -188,6 +189,18 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			return
 		}
 		if claims != nil {
+			// 2a. Cross-app token replay check (guide §8.5): a token minted for one
+			// app must not be accepted on another app's host. Enforced only when both
+			// sides are known — legacy tokens without the claim (claims.AppID == "")
+			// and unresolved hosts (appID == "", permissive/disabled) pass through.
+			if claims.AppID != "" && appID != "" && claims.AppID != appID {
+				p.log.warnf("jwt app mismatch path=%s user_id=%s token_app_id=%s host_app_id=%s", req.URL.Path, claims.UserID, claims.AppID, appID)
+				writeJSON(rw, http.StatusUnauthorized, map[string]string{
+					"error":   "unauthorized",
+					"message": "token was not issued for this application",
+				})
+				return
+			}
 			expStr := "none"
 			if !claims.ExpiresAt.IsZero() {
 				expStr = claims.ExpiresAt.Format(time.RFC3339)
@@ -200,32 +213,44 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		p.log.debugf("jwt skipped path=%s (disableAuth=true)", req.URL.Path)
 	}
 
-	// 3. Admin access check
-	if ep.AccessLevel == p.config.AdminAccessLevel {
+	// 3. Permission check (RBAC v2, PERMISSIONS_STRATEGY.md). An endpoint may
+	// require a permission tag from the snapshot; the legacy admin access level
+	// implies config.AdminPermission. Fail closed: no claims → 401, identity
+	// unavailable or permission missing → 403.
+	requiredPermission := ep.RequiredPermission
+	if requiredPermission == "" && ep.AccessLevel == p.config.AdminAccessLevel {
+		requiredPermission = p.config.AdminPermission
+	}
+	if requiredPermission != "" {
 		if claims == nil {
-			p.log.warnf("admin endpoint requires auth path=%s", req.URL.Path)
+			p.log.warnf("permission-gated endpoint requires auth path=%s permission=%s", req.URL.Path, requiredPermission)
 			writeJSON(rw, http.StatusUnauthorized, map[string]string{
 				"error":   "unauthorized",
-				"message": "authentication required for admin endpoints",
+				"message": "authentication required for this endpoint",
 			})
 			return
 		}
-		isAdmin, err := p.identity.IsAdmin(ctx, appID, claims.UserID)
+		authz, err := p.identity.Authz(ctx, appID, claims.UserID)
 		if err != nil {
-			p.log.warnf("identity admin check failed user_id=%s error=%v", claims.UserID, err)
+			p.log.warnf("identity authz check failed user_id=%s error=%v", claims.UserID, err)
 		}
-		if err != nil || !isAdmin {
-			if err == nil && !isAdmin {
-				p.log.warnf("admin access denied user_id=%s path=%s", claims.UserID, req.URL.Path)
+		if err != nil || !authz.Has(requiredPermission) {
+			if err == nil {
+				p.log.warnf("permission denied user_id=%s path=%s required=%s roles=%v", claims.UserID, req.URL.Path, requiredPermission, authz.Roles)
 			}
 			writeJSON(rw, http.StatusForbidden, map[string]string{
 				"error":   "forbidden",
-				"message": "admin access required",
+				"message": "insufficient permissions",
 			})
 			return
 		}
-		p.log.infof("admin access granted user_id=%s path=%s", claims.UserID, req.URL.Path)
-		req.Header.Set(p.config.IsAdminHeader, "true")
+		p.log.infof("permission granted user_id=%s path=%s permission=%s", claims.UserID, req.URL.Path, requiredPermission)
+		if authz.IsAdmin {
+			req.Header.Set(p.config.IsAdminHeader, "true")
+		}
+		if len(authz.Roles) > 0 {
+			req.Header.Set(p.config.UserRolesHeader, strings.Join(authz.Roles, ","))
+		}
 	}
 
 	// 4. Determine rate-limit identity and plan

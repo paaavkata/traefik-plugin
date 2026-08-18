@@ -71,9 +71,14 @@ func parseJWT(authHeader, secret, expectedIssuer string) (*TokenClaims, error) {
 		expAt = exp.Time
 	}
 
+	// Optional per-app claim (guide §8.5). identity-service mints it on every
+	// access/refresh token; empty for legacy tokens issued before the claim existed.
+	tokenAppID, _ := claims["app_id"].(string)
+
 	return &TokenClaims{
 		UserID:    sub,
 		Issuer:    iss,
+		AppID:     tokenAppID,
 		ExpiresAt: expAt,
 	}, nil
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -48,6 +49,18 @@ func setupTestSnapshot() *SnapshotCache {
 								AccessLevel: "admin",
 								RateLimits: map[string]RateLimitValue{
 									"free": {Requests: 0, DurationSeconds: 60},
+								},
+							},
+							{
+								UID:                "ep3",
+								Method:             "POST",
+								Path:               "/v1/comments/hide",
+								FullPath:           "/api/conversion/v1/comments/hide",
+								PathRegex:          `^/api/conversion/v1/comments/hide$`,
+								AccessLevel:        "authenticated",
+								RequiredPermission: "content.moderate",
+								RateLimits: map[string]RateLimitValue{
+									"free": {Requests: 10, DurationSeconds: 60},
 								},
 							},
 						},
@@ -623,6 +636,127 @@ func TestPlugin_AppResolution_StripsInboundHeader_PassThrough(t *testing.T) {
 	}
 }
 
+// Cross-app token replay (§8.5): a token minted for app "cms" presented on the
+// fileconvert host must be rejected with 401.
+func TestPlugin_JWTAppClaim_Mismatch_401(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	plugin := &GatewayPlugin{
+		next:        next,
+		name:        "test",
+		config:      config,
+		snapshot:    setupTestSnapshot(),
+		appRegistry: setupTestAppRegistry(),
+		identity:    newIdentityClient("http://localhost:9999", 1*time.Second, nil),
+		planResolver: &PlanResolver{
+			cache: make(map[string]planCacheEntry),
+		},
+	}
+
+	token := createTestTokenWithApp("test-secret", 99, "file-convert.online", "cms", time.Now().Add(time.Hour))
+	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+	req.Host = "fileconvert.online"
+	req.Header.Set("Authorization", "Bearer "+token)
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for cross-app token replay, got %d", rr.Code)
+	}
+}
+
+// Matching token app_id claim → request proceeds and headers are stamped.
+func TestPlugin_JWTAppClaim_Match_OK(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+
+	var capturedUserID, capturedAppID string
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		capturedUserID = req.Header.Get("X-User-Id")
+		capturedAppID = req.Header.Get("X-App-Id")
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	serviceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"plan_name": "pro"})
+	}))
+	defer serviceServer.Close()
+
+	plugin := &GatewayPlugin{
+		next:         next,
+		name:         "test",
+		config:       config,
+		snapshot:     setupTestSnapshot(),
+		appRegistry:  setupTestAppRegistry(),
+		identity:     newIdentityClient("http://localhost:9999", 1*time.Second, nil),
+		planResolver: newPlanResolver(serviceServer.URL, 5*time.Second, nil),
+	}
+
+	token := createTestTokenWithApp("test-secret", 99, "file-convert.online", "fileconvert", time.Now().Add(time.Hour))
+	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+	req.Host = "fileconvert.online"
+	req.Header.Set("Authorization", "Bearer "+token)
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 for matching token app_id, got %d", rr.Code)
+	}
+	if capturedUserID != "99" {
+		t.Errorf("expected X-User-Id=99, got %q", capturedUserID)
+	}
+	if capturedAppID != "fileconvert" {
+		t.Errorf("expected X-App-Id=fileconvert, got %q", capturedAppID)
+	}
+}
+
+// Legacy token without an app_id claim is accepted during rollout.
+func TestPlugin_JWTAppClaim_LegacyTokenWithoutClaim_OK(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	serviceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"plan_name": "free"})
+	}))
+	defer serviceServer.Close()
+
+	plugin := &GatewayPlugin{
+		next:         next,
+		name:         "test",
+		config:       config,
+		snapshot:     setupTestSnapshot(),
+		appRegistry:  setupTestAppRegistry(),
+		identity:     newIdentityClient("http://localhost:9999", 1*time.Second, nil),
+		planResolver: newPlanResolver(serviceServer.URL, 5*time.Second, nil),
+	}
+
+	token := createTestToken("test-secret", 99, "file-convert.online", time.Now().Add(time.Hour))
+	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+	req.Host = "fileconvert.online"
+	req.Header.Set("Authorization", "Bearer "+token)
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 for legacy token without app_id claim, got %d", rr.Code)
+	}
+}
+
 // Enforce mode + unknown host → 403.
 func TestPlugin_AppResolution_UnknownHost_Enforce_403(t *testing.T) {
 	config := CreateConfig()
@@ -1076,5 +1210,177 @@ func TestPlugin_CORS_Preflight_UnknownHost_Enforce(t *testing.T) {
 	}
 	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "https://file-convert.online" {
 		t.Errorf("expected ACAO on preflight, got %q", got)
+	}
+}
+
+// --- RBAC v2 permission gate (PERMISSIONS_STRATEGY.md) ---
+
+func newAuthzIdentityServer(t *testing.T, roles, permissions []string, isAdmin bool, authzStatus int) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/authz") {
+			if authzStatus != http.StatusOK {
+				w.WriteHeader(authzStatus)
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status": "success", "message": "ok",
+				"data": map[string]interface{}{
+					"roles": roles, "permissions": permissions, "is_admin": isAdmin,
+				},
+			})
+			return
+		}
+		// Legacy admin-status fallback path.
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "success", "message": "ok",
+			"data": map[string]bool{"is_admin": isAdmin},
+		})
+	}))
+}
+
+func newPlanServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"plan_name": "free"})
+	}))
+}
+
+func TestPlugin_PermissionEndpoint_ModeratorAllowed(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+
+	identityServer := newAuthzIdentityServer(t, []string{"Moderator"}, []string{"content.moderate"}, false, http.StatusOK)
+	defer identityServer.Close()
+	planServer := newPlanServer(t)
+	defer planServer.Close()
+
+	var gotRoles, gotIsAdmin string
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		gotRoles = req.Header.Get("X-User-Roles")
+		gotIsAdmin = req.Header.Get("X-Is-Admin")
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	plugin := &GatewayPlugin{
+		next:         next,
+		name:         "test",
+		config:       config,
+		snapshot:     setupTestSnapshot(),
+		identity:     newIdentityClient(identityServer.URL, 5*time.Second, nil),
+		planResolver: newPlanResolver(planServer.URL, 5*time.Second, nil),
+	}
+
+	token := createTestToken("test-secret", 42, "file-convert.online", time.Now().Add(time.Hour))
+	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/comments/hide", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 for moderator, got %d", rr.Code)
+	}
+	if gotRoles != "Moderator" {
+		t.Errorf("expected X-User-Roles=Moderator, got %q", gotRoles)
+	}
+	if gotIsAdmin != "" {
+		t.Errorf("moderator is not admin; expected no X-Is-Admin, got %q", gotIsAdmin)
+	}
+}
+
+func TestPlugin_PermissionEndpoint_InsufficientPermissions(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+
+	identityServer := newAuthzIdentityServer(t, []string{"User"}, []string{}, false, http.StatusOK)
+	defer identityServer.Close()
+
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	plugin := &GatewayPlugin{
+		next:     next,
+		name:     "test",
+		config:   config,
+		snapshot: setupTestSnapshot(),
+		identity: newIdentityClient(identityServer.URL, 5*time.Second, nil),
+	}
+
+	token := createTestToken("test-secret", 42, "file-convert.online", time.Now().Add(time.Hour))
+	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/comments/hide", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Errorf("expected 403 without content.moderate, got %d", rr.Code)
+	}
+}
+
+func TestPlugin_PermissionEndpoint_AnonymousUnauthorized(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+
+	plugin := &GatewayPlugin{
+		next:     http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) { rw.WriteHeader(http.StatusOK) }),
+		name:     "test",
+		config:   config,
+		snapshot: setupTestSnapshot(),
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/comments/hide", nil)
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for anonymous on permission-gated endpoint, got %d", rr.Code)
+	}
+}
+
+func TestPlugin_AdminEndpoint_AuthzFallbackToAdminStatus(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+
+	// Older identity-service: /authz 404s, /admin-status works.
+	identityServer := newAuthzIdentityServer(t, nil, nil, true, http.StatusNotFound)
+	defer identityServer.Close()
+	planServer := newPlanServer(t)
+	defer planServer.Close()
+
+	var gotIsAdmin string
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		gotIsAdmin = req.Header.Get("X-Is-Admin")
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	plugin := &GatewayPlugin{
+		next:         next,
+		name:         "test",
+		config:       config,
+		snapshot:     setupTestSnapshot(),
+		identity:     newIdentityClient(identityServer.URL, 5*time.Second, nil),
+		planResolver: newPlanResolver(planServer.URL, 5*time.Second, nil),
+	}
+
+	token := createTestToken("test-secret", 42, "file-convert.online", time.Now().Add(time.Hour))
+	req := httptest.NewRequest(http.MethodGet, "/api/conversion/v1/admin/users", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200 via admin-status fallback, got %d", rr.Code)
+	}
+	if gotIsAdmin != "true" {
+		t.Errorf("expected X-Is-Admin=true via fallback, got %q", gotIsAdmin)
 	}
 }

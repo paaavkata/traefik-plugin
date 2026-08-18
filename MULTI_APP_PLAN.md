@@ -1,6 +1,12 @@
 # traefik-plugin — Multi-App (`app_id` from host) Implementation Plan
 
-> **Status: PLAN ONLY.** No source under `traefik-plugin/` is modified by this document.
+> **Status: IMPLEMENTED (verified against code 2026-08-06).** Host→app_id resolution
+> (`registry.go`), unconditional inbound strip + trusted stamp, `enforce` default (config +
+> k8s middleware manifests), per-app endpoint matching (`snapshot.go` apps[] wrapper),
+> per-app plan/admin resolution, app-prefixed rate-limit keys, and the §8.5 JWT `app_id`
+> claim check are all live and covered by `plugin_test.go`/`jwt_test.go`/`registry_test.go`.
+> The remaining `TODO(trust)` log line in `plugin.go` fires only in permissive mode (local/
+> debug); it is not a gap. Kept below as the original design record.
 > Designed against `MULTI_APP_PLATFORM_GUIDE.md` §4 (trust model), §8 (locked decisions),
 > §10 (PINNED contract — trusted header is exactly `X-App-Id`), §11 (registry API).
 >

@@ -68,10 +68,16 @@ type Config struct {
 	AdminAccessLevel string `json:"adminAccessLevel" yaml:"adminAccessLevel"`
 	FreeAccessLevel  string `json:"freeAccessLevel" yaml:"freeAccessLevel"`
 
+	// AdminPermission is the RBAC v2 permission tag implied by the admin access
+	// level; endpoints may also carry an explicit required_permission in the
+	// snapshot (PERMISSIONS_STRATEGY.md).
+	AdminPermission string `json:"adminPermission" yaml:"adminPermission"`
+
 	// Headers forwarded downstream
-	UserIDHeader   string `json:"userIdHeader" yaml:"userIdHeader"`
-	UserPlanHeader string `json:"userPlanHeader" yaml:"userPlanHeader"`
-	IsAdminHeader  string `json:"isAdminHeader" yaml:"isAdminHeader"`
+	UserIDHeader    string `json:"userIdHeader" yaml:"userIdHeader"`
+	UserPlanHeader  string `json:"userPlanHeader" yaml:"userPlanHeader"`
+	IsAdminHeader   string `json:"isAdminHeader" yaml:"isAdminHeader"`
+	UserRolesHeader string `json:"userRolesHeader" yaml:"userRolesHeader"`
 
 	// Timeout for upstream service calls
 	HTTPTimeout string `json:"httpTimeout" yaml:"httpTimeout"`
@@ -123,9 +129,11 @@ func CreateConfig() *Config {
 		DefaultPlanName:                 "free",
 		AdminAccessLevel:                "admin",
 		FreeAccessLevel:                 "free",
+		AdminPermission:                 "platform.admin",
 		UserIDHeader:                    "X-User-Id",
 		UserPlanHeader:                  "X-User-Plan",
 		IsAdminHeader:                   "X-Is-Admin",
+		UserRolesHeader:                 "X-User-Roles",
 		HTTPTimeout:                     "5s",
 		LogLevel:                        "info",
 	}

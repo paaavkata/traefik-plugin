@@ -11,6 +11,32 @@ spec:
       jwtSecret: "22LWtG2qr9I0EtNtrb8fzEWmlqRTiw1k7X82A1H6BJc="
       jwtIssuer: "file-convert.online"
       jwtHeaderKey: "Authorization"
+      # --- Dual-issuer auth (Keycloak migration plan §2.1) -----------------------
+      # Apps listed in keycloakApps validate bearer tokens via Keycloak RS256+JWKS;
+      # every other app keeps the HS256 shared-secret path above UNCHANGED. Removing
+      # this whole block (or emptying keycloakApps) restores pre-Keycloak behaviour.
+      # The infra-gitops middleware manifests (dev + prod) must mirror this block.
+      #
+      # In-cluster JWKS endpoint of the platform realm (an OIDC discovery URL also
+      # works — the plugin follows jwks_uri). NetPol must allow traefik pods →
+      # keycloak-service.keycloak.svc:8080.
+      keycloakJwksUrl: "http://keycloak-service.keycloak.svc:8080/realms/platform/protocol/openid-connect/certs"
+      # Expected `iss` claim, byte-for-byte: Keycloak's PUBLIC frontend URL + realm.
+      # Must match the Keycloak `hostname` setting; if the pending public-auth-host
+      # decision lands on auth.cloudfusion.tech, change BOTH there and here.
+      keycloakIssuer: "https://auth.internal.cloudfusion.tech/realms/platform"
+      # app_ids (host-resolved via application-service) that authenticate via Keycloak.
+      keycloakApps:
+        - "scantinel"
+      # X-User-Id source claim (legacy_user_id protocol mapper), falling back to sub.
+      keycloakUserIdClaim: "luid"
+      # Roles (client roles of the azp client + realm roles) that imply X-Is-Admin.
+      keycloakAdminRoles:
+        - "admin"
+        - "owner"
+      keycloakClockSkewSeconds: 30
+      jwksRefreshInterval: "10m"
+      jwksRefetchCooldown: "30s"
       sessionIdHeader: "X-Session-Id"
       deviceIdHeader: "X-Device-Id"
       redisUrl: "redis://redis-master.fc-infra-dev:6379/0"

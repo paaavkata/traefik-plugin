@@ -17,6 +17,12 @@ type TokenClaims struct {
 	// tokens issued before the claim existed (allowed during rollout).
 	AppID     string
 	ExpiresAt time.Time
+
+	// Keycloak-only fields — populated by parseKeycloakJWT, zero for legacy HS256
+	// tokens (whose admin/roles resolution stays on the identity-service HTTP path).
+	Keycloak bool
+	IsAdmin  bool
+	Roles    []string
 }
 
 // parseJWT extracts and validates a JWT from the Authorization header value.
@@ -81,4 +87,137 @@ func parseJWT(authHeader, secret, expectedIssuer string) (*TokenClaims, error) {
 		AppID:     tokenAppID,
 		ExpiresAt: expAt,
 	}, nil
+}
+
+// parseKeycloakJWT extracts and validates a Keycloak RS256 access token from the
+// Authorization header value. Returns nil claims (no error) if the header is empty
+// (anonymous request). All validation failures return an error — the caller fails
+// closed with 401.
+//
+// Guarantees:
+//   - RS256 only (jwt.WithValidMethods) — an HS256 token can never pass here, and a
+//     Keycloak-issued token can never pass the legacy HS256 path (alg-confusion guard
+//     in both directions; dispatch is by app_id, validation by algorithm).
+//   - `iss` must equal expectedIssuer byte-for-byte.
+//   - signature key selected by `kid` via the JWKS cache (rotation-aware).
+//   - exp/nbf/iat validated with `leeway` clock skew.
+//   - `app_id` claim REQUIRED (the hardcoded per-client mapper always sets it);
+//     the caller's replay check (token.app_id == host app_id) runs unchanged.
+//   - X-User-Id source: claims[userIDClaim] (default "luid" = legacy_user_id
+//     mapper, so migrated users keep their numeric id) falling back to `sub`.
+//   - roles: client roles of the authorized party (resource_access[azp].roles)
+//     plus realm roles (realm_access.roles); IsAdmin ⇔ intersection with adminRoles.
+func parseKeycloakJWT(authHeader string, keys rsaKeyProvider, expectedIssuer, userIDClaim string, leeway time.Duration, adminRoles []string) (*TokenClaims, error) {
+	if authHeader == "" {
+		return nil, nil
+	}
+
+	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+	if tokenStr == authHeader {
+		return nil, fmt.Errorf("malformed authorization header")
+	}
+
+	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		kid, _ := t.Header["kid"].(string)
+		if kid == "" {
+			return nil, fmt.Errorf("token missing kid header")
+		}
+		return keys.keyForKid(kid)
+	}, jwt.WithValidMethods([]string{"RS256"}), jwt.WithLeeway(leeway))
+
+	if err != nil {
+		return nil, fmt.Errorf("invalid token: %w", err)
+	}
+	if !token.Valid {
+		return nil, fmt.Errorf("token is not valid")
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return nil, fmt.Errorf("cannot parse claims")
+	}
+
+	iss, _ := claims.GetIssuer()
+	if iss != expectedIssuer {
+		return nil, fmt.Errorf("issuer mismatch: got %q, want %q", iss, expectedIssuer)
+	}
+
+	sub, _ := claims.GetSubject()
+	if sub == "" {
+		return nil, fmt.Errorf("token missing subject")
+	}
+
+	// Fail closed on a missing app_id: every app client carries the hardcoded-claim
+	// mapper, so a Keycloak token without it was not minted by one of our clients.
+	tokenAppID, _ := claims["app_id"].(string)
+	if tokenAppID == "" {
+		return nil, fmt.Errorf("token missing app_id claim")
+	}
+
+	userID := sub
+	if userIDClaim != "" {
+		if v, ok := claims[userIDClaim].(string); ok && v != "" {
+			userID = v
+		}
+	}
+
+	expAt := time.Time{}
+	if exp, _ := claims.GetExpirationTime(); exp != nil {
+		expAt = exp.Time
+	}
+
+	roles := keycloakRoles(claims)
+	isAdmin := false
+	for _, r := range roles {
+		for _, a := range adminRoles {
+			if r == a {
+				isAdmin = true
+			}
+		}
+	}
+
+	return &TokenClaims{
+		UserID:    userID,
+		Issuer:    iss,
+		AppID:     tokenAppID,
+		ExpiresAt: expAt,
+		Keycloak:  true,
+		IsAdmin:   isAdmin,
+		Roles:     roles,
+	}, nil
+}
+
+// keycloakRoles collects the app-scoped client roles of the authorized party
+// (resource_access[azp].roles) and the realm roles (realm_access.roles), deduped,
+// client roles first.
+func keycloakRoles(claims jwt.MapClaims) []string {
+	roles := []string{}
+	seen := map[string]bool{}
+	appendRoles := func(v interface{}) {
+		arr, ok := v.([]interface{})
+		if !ok {
+			return
+		}
+		for _, item := range arr {
+			if s, ok := item.(string); ok && s != "" && !seen[s] {
+				seen[s] = true
+				roles = append(roles, s)
+			}
+		}
+	}
+
+	if azp, _ := claims["azp"].(string); azp != "" {
+		if ra, ok := claims["resource_access"].(map[string]interface{}); ok {
+			if client, ok := ra[azp].(map[string]interface{}); ok {
+				appendRoles(client["roles"])
+			}
+		}
+	}
+	if realm, ok := claims["realm_access"].(map[string]interface{}); ok {
+		appendRoles(realm["roles"])
+	}
+	return roles
 }

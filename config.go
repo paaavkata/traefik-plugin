@@ -4,10 +4,53 @@ import "time"
 
 // Config holds the plugin configuration set via Traefik static/dynamic config.
 type Config struct {
-	// JWT
+	// JWT (legacy HS256 shared-secret path — identity-service tokens). This remains
+	// the validator for every app NOT listed in KeycloakApps.
 	JWTSecret    string `json:"jwtSecret" yaml:"jwtSecret"`
 	JWTIssuer    string `json:"jwtIssuer" yaml:"jwtIssuer"`
 	JWTHeaderKey string `json:"jwtHeaderKey" yaml:"jwtHeaderKey"`
+
+	// --- Keycloak / dual-issuer (RS256 + JWKS) ---------------------------------
+	// Apps listed in KeycloakApps authenticate against Keycloak; all other apps keep
+	// the HS256 path above unchanged. Leaving KeycloakApps empty disables the
+	// Keycloak path entirely (behaviour identical to before this feature existed).
+
+	// KeycloakApps is the list of app_ids (as resolved from the request host via the
+	// application registry) whose bearer tokens are validated on the Keycloak
+	// RS256/JWKS path, e.g. ["scantinel"].
+	KeycloakApps []string `json:"keycloakApps" yaml:"keycloakApps"`
+
+	// KeycloakJWKSURL is the JWKS endpoint of the realm, e.g. (in-cluster)
+	//   http://keycloak-service.keycloak.svc:8080/realms/platform/protocol/openid-connect/certs
+	// An OIDC discovery URL (…/.well-known/openid-configuration) is also accepted;
+	// the plugin follows its jwks_uri. Required when KeycloakApps is non-empty.
+	KeycloakJWKSURL string `json:"keycloakJwksUrl" yaml:"keycloakJwksUrl"`
+
+	// KeycloakIssuer is the expected `iss` claim, byte-for-byte, i.e. the realm's
+	// PUBLIC frontend URL: https://<auth-host>/realms/platform. Required when
+	// KeycloakApps is non-empty. Tokens with any other issuer are rejected (401).
+	KeycloakIssuer string `json:"keycloakIssuer" yaml:"keycloakIssuer"`
+
+	// KeycloakUserIDClaim is the claim stamped into X-User-Id when present on the
+	// token, falling back to `sub`. Default "luid" — the legacy_user_id protocol
+	// mapper — so migrated users keep their numeric platform user id.
+	KeycloakUserIDClaim string `json:"keycloakUserIdClaim" yaml:"keycloakUserIdClaim"`
+
+	// KeycloakAdminRoles: a token whose Keycloak roles (client roles of the azp
+	// client, plus realm roles) intersect this list is stamped X-Is-Admin: true.
+	KeycloakAdminRoles []string `json:"keycloakAdminRoles" yaml:"keycloakAdminRoles"`
+
+	// KeycloakClockSkewSeconds is the leeway applied to exp/nbf/iat validation on
+	// the Keycloak path (gateway and Keycloak clocks may drift). Default 30.
+	KeycloakClockSkewSeconds int `json:"keycloakClockSkewSeconds" yaml:"keycloakClockSkewSeconds"`
+
+	// JWKSRefreshInterval is the background JWKS re-fetch period (key rotation
+	// pickup without traffic). Default "10m".
+	JWKSRefreshInterval string `json:"jwksRefreshInterval" yaml:"jwksRefreshInterval"`
+
+	// JWKSRefetchCooldown rate-limits on-demand re-fetches triggered by tokens with
+	// an unknown `kid`, so attacker-minted kids cannot flood Keycloak. Default "30s".
+	JWKSRefetchCooldown string `json:"jwksRefetchCooldown" yaml:"jwksRefetchCooldown"`
 
 	// Session ID header for anonymous rate-limiting
 	SessionIDHeader string `json:"sessionIdHeader" yaml:"sessionIdHeader"`
@@ -106,6 +149,11 @@ func CreateConfig() *Config {
 	return &Config{
 		JWTIssuer:                       "file-convert.online",
 		JWTHeaderKey:                    "Authorization",
+		KeycloakUserIDClaim:             "luid",
+		KeycloakAdminRoles:              []string{"admin", "owner"},
+		KeycloakClockSkewSeconds:        30,
+		JWKSRefreshInterval:             "10m",
+		JWKSRefetchCooldown:             "30s",
 		SessionIDHeader:                 "X-Session-Id",
 		DeviceIDHeader:                  "X-Device-Id",
 		RedisURL:                        "redis://127.0.0.1:6379/0",

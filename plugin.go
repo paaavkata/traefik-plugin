@@ -21,6 +21,12 @@ type GatewayPlugin struct {
 	rateLimiter  *RateLimiter
 	identity     *IdentityClient
 	planResolver *PlanResolver
+
+	// Dual-issuer (Keycloak) state. keycloakApps empty ⇒ every request takes the
+	// legacy HS256 path exactly as before.
+	jwks           *JWKSCache
+	keycloakApps   map[string]bool
+	keycloakLeeway time.Duration
 }
 
 // New creates a new plugin instance.
@@ -67,10 +73,74 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	// Identity client
 	plugin.identity = newIdentityClient(config.IdentityServiceURL, httpTimeout, plog)
 
+	// Keycloak dual-issuer path (additive; inert when keycloakApps is empty).
+	kcApps, err := buildKeycloakAppSet(config)
+	if err != nil {
+		return nil, err
+	}
+	plugin.keycloakApps = kcApps
+	plugin.keycloakLeeway = time.Duration(config.KeycloakClockSkewSeconds) * time.Second
+	if len(kcApps) > 0 {
+		jwksRefresh := parseDuration(config.JWKSRefreshInterval, 10*time.Minute)
+		jwksCooldown := parseDuration(config.JWKSRefetchCooldown, 30*time.Second)
+		plugin.jwks = getSharedJWKSCache(config.KeycloakJWKSURL, httpTimeout, jwksRefresh, jwksCooldown, plog)
+	}
+
 	// Plan resolver
 	plugin.planResolver = newPlanResolver(config.ServiceServiceURL, httpTimeout, plog)
 
 	return plugin, nil
+}
+
+// buildKeycloakAppSet validates the Keycloak config block and returns the set of
+// app_ids that authenticate via Keycloak. Empty list ⇒ Keycloak path disabled.
+func buildKeycloakAppSet(config *Config) (map[string]bool, error) {
+	apps := make(map[string]bool, len(config.KeycloakApps))
+	for _, a := range config.KeycloakApps {
+		a = strings.TrimSpace(a)
+		if a != "" {
+			apps[a] = true
+		}
+	}
+	if len(apps) > 0 {
+		if config.KeycloakJWKSURL == "" {
+			return nil, fmt.Errorf("traefik-gateway-plugin: keycloakApps is set but keycloakJwksUrl is empty")
+		}
+		if config.KeycloakIssuer == "" {
+			return nil, fmt.Errorf("traefik-gateway-plugin: keycloakApps is set but keycloakIssuer is empty")
+		}
+	}
+	return apps, nil
+}
+
+// isKeycloakApp reports whether the resolved app authenticates via Keycloak.
+// Unresolved app_id ("" — permissive/disabled modes) always uses the legacy path.
+func (p *GatewayPlugin) isKeycloakApp(appID string) bool {
+	return appID != "" && p.keycloakApps[appID]
+}
+
+// parseKeycloakAuth validates a bearer token on the Keycloak RS256/JWKS path.
+// Fails closed if the JWKS cache was never configured (misconfiguration must not
+// silently fall back to the shared-secret path).
+func (p *GatewayPlugin) parseKeycloakAuth(authHeader string) (*TokenClaims, error) {
+	if authHeader == "" {
+		return nil, nil // anonymous — same contract as parseJWT
+	}
+	if p.jwks == nil {
+		return nil, fmt.Errorf("keycloak validation not configured")
+	}
+	return parseKeycloakJWT(authHeader, p.jwks, p.config.KeycloakIssuer, p.config.KeycloakUserIDClaim, p.keycloakLeeway, p.config.KeycloakAdminRoles)
+}
+
+// authzFromTokenRoles synthesizes a UserAuthz from Keycloak token roles without an
+// identity-service round-trip (migration plan §2.3 Phase 1): admins get the
+// wildcard permission — exactly the pre-RBAC fallback already coded in identity.go.
+func authzFromTokenRoles(claims *TokenClaims) *UserAuthz {
+	authz := &UserAuthz{Roles: claims.Roles, Permissions: []string{}, IsAdmin: claims.IsAdmin}
+	if claims.IsAdmin {
+		authz.Permissions = []string{"*"}
+	}
+	return authz
 }
 
 // applyCORSHeaders sets Access-Control-* headers when the request Origin matches
@@ -174,12 +244,20 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	p.log.debugf("incoming request method=%s path=%s remote=%q headers=[%s]", req.Method, req.URL.Path, req.RemoteAddr, formatRequestHeaders(req))
 
-	// 2. Parse JWT (if present)
+	// 2. Parse JWT (if present). Dual-issuer dispatch by the host-resolved app_id:
+	// Keycloak apps → RS256 + JWKS + Keycloak issuer; everything else → the legacy
+	// HS256 shared-secret path, byte-for-byte unchanged. Because each path pins its
+	// algorithm (WithValidMethods), a token from one issuer can never validate on
+	// the other's path (alg-confusion guard in both directions).
 	var claims *TokenClaims
 	if !p.config.DisableAuth {
 		authHeader := req.Header.Get(p.config.JWTHeaderKey)
 		var err error
-		claims, err = parseJWT(authHeader, p.config.JWTSecret, p.config.JWTIssuer)
+		if p.isKeycloakApp(appID) {
+			claims, err = p.parseKeycloakAuth(authHeader)
+		} else {
+			claims, err = parseJWT(authHeader, p.config.JWTSecret, p.config.JWTIssuer)
+		}
 		if err != nil {
 			p.log.errorf("jwt auth failure path=%s error=%v", req.URL.Path, err)
 			writeJSON(rw, http.StatusUnauthorized, map[string]string{
@@ -230,9 +308,17 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			})
 			return
 		}
-		authz, err := p.identity.Authz(ctx, appID, claims.UserID)
-		if err != nil {
-			p.log.warnf("identity authz check failed user_id=%s error=%v", claims.UserID, err)
+		var authz *UserAuthz
+		var err error
+		if claims.Keycloak {
+			// Keycloak tokens carry their roles; no identity-service round-trip
+			// (migration plan §2.3 Phase 1 — admin ⇒ wildcard permission).
+			authz = authzFromTokenRoles(claims)
+		} else {
+			authz, err = p.identity.Authz(ctx, appID, claims.UserID)
+			if err != nil {
+				p.log.warnf("identity authz check failed user_id=%s error=%v", claims.UserID, err)
+			}
 		}
 		if err != nil || !authz.Has(requiredPermission) {
 			if err == nil {
@@ -262,6 +348,16 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		planName = p.planResolver.Resolve(ctx, appID, claims.UserID, p.config.DefaultPlanName)
 		req.Header.Set(p.config.UserIDHeader, claims.UserID)
 		req.Header.Set(p.config.UserPlanHeader, planName)
+		if claims.Keycloak {
+			// Keycloak tokens carry admin/roles directly (frozen header contract:
+			// same X-Is-Admin/X-User-Roles the identity-service path stamps).
+			if claims.IsAdmin {
+				req.Header.Set(p.config.IsAdminHeader, "true")
+			}
+			if len(claims.Roles) > 0 {
+				req.Header.Set(p.config.UserRolesHeader, strings.Join(claims.Roles, ","))
+			}
+		}
 		// Remove any client-supplied session header so backends can trust X-User-Id alone.
 		req.Header.Del(p.config.SessionIDHeader)
 	} else {

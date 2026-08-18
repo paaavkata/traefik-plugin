@@ -4,7 +4,7 @@ Traefik middleware plugin for the FileConvert API gateway. Handles JWT authentic
 
 ## Features
 
-- **JWT validation** — decodes HS256 tokens issued by identity-service, rejects expired/tampered tokens
+- **JWT validation (dual-issuer)** — legacy HS256 tokens issued by identity-service (shared secret), plus Keycloak RS256 tokens (JWKS, per-`kid` key cache) for apps listed in `keycloakApps`; rejects expired/tampered tokens, fails closed
 - **Admin access control** — endpoints marked `admin` in the registry require admin role (checked via identity-service)
 - **Rate limiting** — fixed-window limiter backed by Redis, per-user or per-session, plan-aware limits from service-service snapshot
 - **Registry snapshot** — polls service-service for endpoint metadata (access levels, rate limits per plan)
@@ -34,8 +34,16 @@ All options are configurable via the Traefik Middleware CRD (see `helm/middlewar
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `jwtSecret` | — | HMAC secret for JWT verification |
-| `jwtIssuer` | `file-convert.online` | Expected JWT issuer |
+| `jwtSecret` | — | HMAC secret for JWT verification (legacy HS256 path — all apps not in `keycloakApps`) |
+| `jwtIssuer` | `file-convert.online` | Expected JWT issuer (HS256 path) |
+| `keycloakApps` | `[]` | app_ids validated on the Keycloak RS256/JWKS path (e.g. `[scantinel]`). Empty = Keycloak path disabled entirely |
+| `keycloakJwksUrl` | — | Realm JWKS endpoint (or OIDC discovery URL; `jwks_uri` is followed). Required when `keycloakApps` is set |
+| `keycloakIssuer` | — | Expected `iss`, byte-for-byte (realm public URL). Required when `keycloakApps` is set |
+| `keycloakUserIdClaim` | `luid` | Claim stamped into `X-User-Id` (legacy_user_id mapper), falling back to `sub` |
+| `keycloakAdminRoles` | `admin, owner` | Token roles (azp client roles + realm roles) implying `X-Is-Admin: true` |
+| `keycloakClockSkewSeconds` | `30` | Leeway for exp/nbf/iat validation on the Keycloak path |
+| `jwksRefreshInterval` | `10m` | Background JWKS refresh period |
+| `jwksRefetchCooldown` | `30s` | Min interval between on-demand JWKS refetches triggered by unknown `kid`s |
 | `sessionIdHeader` | `X-Session-Id` | Header for anonymous session identity |
 | `deviceIdHeader` | `X-Device-Id` | FingerprintJS visitor id; preferred anonymous rate-limit key |
 | `redisUrl` | `redis://127.0.0.1:6379/0` | Redis connection URL |
@@ -61,6 +69,65 @@ All options are configurable via the Traefik Middleware CRD (see `helm/middlewar
 | `corsAllowedHeaders` | `Origin Content-Type Accept Authorization X-Session-Id X-Device-Id X-App-Id` | Allowed request headers |
 | `corsAllowCredentials` | `true` | Sets `Access-Control-Allow-Credentials` |
 | `corsMaxAge` | `3600` | Preflight cache TTL in seconds |
+
+## Dual-issuer auth (Keycloak)
+
+Per the Keycloak migration plan (`SecScanApp/plans/02-keycloak-auth-migration.md` §2), the
+gateway supports two token issuers side by side. Dispatch happens **after** host→app_id
+resolution:
+
+- `app_id ∈ keycloakApps` (e.g. `scantinel`) → **RS256 + JWKS** validation: signature key
+  selected by the token's `kid` from the cached realm JWKS, `iss` must equal
+  `keycloakIssuer` exactly, exp/nbf/iat checked with `keycloakClockSkewSeconds` leeway.
+  The `app_id` claim (hardcoded per-client protocol mapper) is REQUIRED and the existing
+  cross-app replay check (`token.app_id == host app_id`) runs unchanged.
+- every other app (fileconvert, …) → the **HS256 shared-secret** path, byte-for-byte
+  unchanged.
+
+Each path pins its algorithm (`WithValidMethods`), so an HS256 token can never validate on
+the Keycloak path or vice versa (alg-confusion guard in both directions).
+
+Downstream header contract is frozen: `X-User-Id` (claim `keycloakUserIdClaim`, default
+`luid`, falling back to `sub`), `X-App-Id` (host registry, unchanged), `X-Is-Admin` /
+`X-User-Roles` (from token roles: `resource_access[azp].roles` + `realm_access.roles` — no
+identity-service round-trip for Keycloak tokens), `X-User-Plan` (service-service rate-tier,
+unchanged).
+
+JWKS handling: keys cached by `kid`; unknown `kid` triggers an on-demand refetch (rotation
+pickup) rate-limited by `jwksRefetchCooldown`; a background refresh runs every
+`jwksRefreshInterval`; on fetch failure the last-good key set keeps serving, so a Keycloak
+outage does not invalidate existing sessions (only new logins/refreshes fail, at Keycloak).
+
+**Yaegi note:** the JWKS client is hand-rolled on stdlib only (`net/http`,
+`encoding/json`, `encoding/base64`, `math/big`, `crypto/rsa`) — no JOSE library — because
+the plugin runs interpreted. RS256 verification itself is done by the already-vendored
+`golang-jwt/jwt/v5`, whose full package (including `rsa.go`) is already interpreted by
+Yaegi today for the HS256 path. Still, smoke-test on a dev cluster before relying on it.
+
+### infra-gitops requirements (dev + prod middleware manifests)
+
+```yaml
+keycloakJwksUrl: "http://keycloak-service.keycloak.svc:8080/realms/platform/protocol/openid-connect/certs"
+keycloakIssuer: "https://auth.internal.cloudfusion.tech/realms/platform"   # MUST match token `iss` exactly
+keycloakApps: ["scantinel"]
+keycloakUserIdClaim: "luid"
+keycloakAdminRoles: ["admin", "owner"]
+keycloakClockSkewSeconds: 30
+jwksRefreshInterval: "10m"
+jwksRefetchCooldown: "30s"
+```
+
+Also required in infra-gitops:
+
+1. **NetworkPolicy**: traefik pods → `keycloak-service.keycloak.svc:8080` (JWKS fetch).
+2. **Issuer/hostname coupling**: `keycloakIssuer` must equal the realm's public frontend
+   URL. If/when the public auth hostname decision (plan §0 prerequisite) moves Keycloak to
+   `auth.cloudfusion.tech`, update `keycloakIssuer` in the same change.
+3. **Realm prerequisites** (plan Appendix A): `scantinel-web` client with the
+   `oidc-hardcoded-claim-mapper` for `app_id=scantinel`, the `luid` user-attribute mapper,
+   and client roles `admin`/`owner`.
+4. Rollback: set `keycloakApps: []` (or drop the block) — the plugin reverts to
+   HS256-only behaviour; no image change needed.
 
 ## Deployment
 

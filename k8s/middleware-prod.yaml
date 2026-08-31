@@ -34,6 +34,10 @@ spec:
       # survives or arrives as X-Forwarded-Host. Default false (resolve from req.Host).
       trustForwardedHost: false
       identityServiceUrl: "http://identity-service.fc-dev"
+      # Internal API-key verify endpoint (contract §4). Not registered in the service
+      # registry — reached in-cluster only, same convention as identityServiceUrl.
+      identityVerifyUrl: "http://identity-service.fc-dev/internal/v1/api-keys/verify"
+      apiKeyUidHeader: "X-Api-Key-Uid"
       usageServiceUrl: "http://usage-service.fc-dev"
       defaultRateLimitRequests: 30
       defaultRateLimitDurationSeconds: 60

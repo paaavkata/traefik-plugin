@@ -56,6 +56,8 @@ All options are configurable via the Traefik Middleware CRD (see `helm/middlewar
 | `appResolutionMode` | `permissive` | `enforce` (unknown/inactive host → 403, cold registry → 503), `permissive` (pass through, no stamp), or `disabled` (skip resolution) |
 | `trustForwardedHost` | `false` | When true resolve from `X-Forwarded-Host`; otherwise from `req.Host` |
 | `identityServiceUrl` | `http://identity-service:8080` | Identity service URL |
+| `identityVerifyUrl` | `http://identity-service:8080/internal/v1/api-keys/verify` | Internal API-key verify endpoint (contract §4). Not registry-registered; full in-cluster path. Verify call is capped at ≤2s; identity unreachable → 503 for key traffic only |
+| `apiKeyUidHeader` | `X-Api-Key-Uid` | Trusted, gateway-stamped API-key uid header (inbound copies stripped on every path) |
 | `usageServiceUrl` | `http://usage-service:8080` | Usage service URL |
 | `defaultRateLimitRequests` | `30` | Fallback rate limit |
 | `defaultRateLimitDurationSeconds` | `60` | Fallback window |

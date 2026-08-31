@@ -225,3 +225,33 @@ func (r *respRedis) expire(ctx context.Context, key string, seconds int) error {
 	}
 	return nil
 }
+
+// get returns the string value at key. A missing key yields ("", false, nil) —
+// a nil bulk reply is a cache miss, not an error.
+func (r *respRedis) get(ctx context.Context, key string) (string, bool, error) {
+	v, err := r.do(ctx, "GET", key)
+	if err != nil {
+		return "", false, err
+	}
+	if v == nil {
+		return "", false, nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", false, fmt.Errorf("redis GET: unexpected type %T", v)
+	}
+	return s, true, nil
+}
+
+// setEX writes key=value with a TTL in seconds (SET key value EX seconds).
+func (r *respRedis) setEX(ctx context.Context, key, value string, seconds int) error {
+	v, err := r.do(ctx, "SET", key, value, "EX", strconv.Itoa(seconds))
+	if err != nil {
+		return err
+	}
+	// SET replies +OK on success.
+	if s, ok := v.(string); !ok || s != "OK" {
+		return fmt.Errorf("redis SET: unexpected reply %v", v)
+	}
+	return nil
+}

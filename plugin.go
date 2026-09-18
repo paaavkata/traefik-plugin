@@ -162,6 +162,21 @@ func authzFromTokenRoles(claims *TokenClaims) *UserAuthz {
 	return authz
 }
 
+// stampAuthzHeaders sets the trusted X-Is-Admin / X-User-Roles headers from a
+// resolved authorization view. Inbound copies were stripped at entry, so an
+// absent header always means "not admin / no roles".
+func (p *GatewayPlugin) stampAuthzHeaders(req *http.Request, authz *UserAuthz) {
+	if authz == nil {
+		return
+	}
+	if authz.IsAdmin {
+		req.Header.Set(p.config.IsAdminHeader, "true")
+	}
+	if len(authz.Roles) > 0 {
+		req.Header.Set(p.config.UserRolesHeader, strings.Join(authz.Roles, ","))
+	}
+}
+
 // applyCORSHeaders sets Access-Control-* headers when the request Origin matches
 // a configured allowed origin. Returns true if the origin was allowed.
 func (p *GatewayPlugin) applyCORSHeaders(rw http.ResponseWriter, origin string) bool {
@@ -329,6 +344,9 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if requiredPermission == "" && ep.AccessLevel == p.config.AdminAccessLevel {
 		requiredPermission = p.config.AdminPermission
 	}
+	// authzStamped records that the permission gate below already resolved and
+	// stamped the caller's admin/roles headers, so step 4 does not repeat it.
+	authzStamped := false
 	if requiredPermission != "" {
 		if claims == nil {
 			p.log.warnf("permission-gated endpoint requires auth path=%s permission=%s", req.URL.Path, requiredPermission)
@@ -361,12 +379,8 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			return
 		}
 		p.log.infof("permission granted user_id=%s path=%s permission=%s", claims.UserID, req.URL.Path, requiredPermission)
-		if authz.IsAdmin {
-			req.Header.Set(p.config.IsAdminHeader, "true")
-		}
-		if len(authz.Roles) > 0 {
-			req.Header.Set(p.config.UserRolesHeader, strings.Join(authz.Roles, ","))
-		}
+		p.stampAuthzHeaders(req, authz)
+		authzStamped = true
 	}
 
 	// 4. Determine rate-limit identity and plan
@@ -381,11 +395,17 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		if claims.Keycloak {
 			// Keycloak tokens carry admin/roles directly (frozen header contract:
 			// same X-Is-Admin/X-User-Roles the identity-service path stamps).
-			if claims.IsAdmin {
-				req.Header.Set(p.config.IsAdminHeader, "true")
-			}
-			if len(claims.Roles) > 0 {
-				req.Header.Set(p.config.UserRolesHeader, strings.Join(claims.Roles, ","))
+			p.stampAuthzHeaders(req, authzFromTokenRoles(claims))
+		} else if !authzStamped {
+			// Legacy tokens: stamp the same admin/roles contract on EVERY
+			// authenticated request, not only on permission-gated endpoints, so
+			// a public endpoint can offer an admin-only behaviour (e.g. the
+			// file-service download ignoring retention expiry for operators).
+			// Fail-soft by design: identity unavailable ⇒ headers absent and the
+			// caller is treated as a regular user; a public endpoint must never
+			// turn into an error because of this lookup.
+			if authz := p.identity.AuthzSoft(ctx, appID, claims.UserID); authz != nil {
+				p.stampAuthzHeaders(req, authz)
 			}
 		}
 		// Remove any client-supplied session header so backends can trust X-User-Id alone.

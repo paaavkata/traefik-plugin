@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1105,6 +1106,188 @@ func TestPlugin_StripsSpoofedIsAdmin_AuthenticatedNonAdminEndpoint(t *testing.T)
 
 	if gotIsAdmin != "" {
 		t.Errorf("expected spoofed X-Is-Admin cleared on non-admin endpoint, got %q", gotIsAdmin)
+	}
+}
+
+// ── Admin/roles stamping on public endpoints (legacy tokens) ─────────────────
+
+// A legacy-token admin on a PUBLIC (non-gated) endpoint gets X-Is-Admin and
+// X-User-Roles stamped, exactly as on a gated endpoint / Keycloak path, so a
+// backend can offer operator-only behaviour on a public route.
+func TestPlugin_PublicEndpoint_LegacyAdmin_StampsIsAdmin(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+	config.AppResolutionMode = "disabled"
+
+	identityServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "success",
+			"data": map[string]interface{}{
+				"roles":       []string{"Admin"},
+				"permissions": []string{"*"},
+				"is_admin":    true,
+			},
+		})
+	}))
+	defer identityServer.Close()
+
+	serviceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"plan_name": "free"})
+	}))
+	defer serviceServer.Close()
+
+	var gotIsAdmin, gotRoles, gotUser string
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		gotIsAdmin = req.Header.Get("X-Is-Admin")
+		gotRoles = req.Header.Get("X-User-Roles")
+		gotUser = req.Header.Get("X-User-Id")
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	plugin := &GatewayPlugin{
+		next:         next,
+		name:         "test",
+		config:       config,
+		snapshot:     setupTestSnapshot(),
+		identity:     newIdentityClient(identityServer.URL, 5*time.Second, nil),
+		planResolver: newPlanResolver(serviceServer.URL, 5*time.Second, nil),
+	}
+
+	token := createTestToken("test-secret", 7, "file-convert.online", time.Now().Add(time.Hour))
+	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	if gotUser != "7" {
+		t.Errorf("expected X-User-Id=7, got %q", gotUser)
+	}
+	if gotIsAdmin != "true" {
+		t.Errorf("expected X-Is-Admin=true on public endpoint for admin, got %q", gotIsAdmin)
+	}
+	if gotRoles != "Admin" {
+		t.Errorf("expected X-User-Roles=Admin, got %q", gotRoles)
+	}
+}
+
+// A legacy-token NON-admin on a public endpoint is forwarded without the admin
+// header (and a spoofed inbound copy stays stripped).
+func TestPlugin_PublicEndpoint_LegacyNonAdmin_NoIsAdmin(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+	config.AppResolutionMode = "disabled"
+
+	identityServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "success",
+			"data": map[string]interface{}{
+				"roles":       []string{"Member"},
+				"permissions": []string{},
+				"is_admin":    false,
+			},
+		})
+	}))
+	defer identityServer.Close()
+
+	serviceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"plan_name": "free"})
+	}))
+	defer serviceServer.Close()
+
+	var gotIsAdmin, gotRoles string
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		gotIsAdmin = req.Header.Get("X-Is-Admin")
+		gotRoles = req.Header.Get("X-User-Roles")
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	plugin := &GatewayPlugin{
+		next:         next,
+		name:         "test",
+		config:       config,
+		snapshot:     setupTestSnapshot(),
+		identity:     newIdentityClient(identityServer.URL, 5*time.Second, nil),
+		planResolver: newPlanResolver(serviceServer.URL, 5*time.Second, nil),
+	}
+
+	token := createTestToken("test-secret", 8, "file-convert.online", time.Now().Add(time.Hour))
+	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-Is-Admin", "true") // spoof
+	rr := httptest.NewRecorder()
+
+	plugin.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	if gotIsAdmin != "" {
+		t.Errorf("expected no X-Is-Admin for non-admin, got %q", gotIsAdmin)
+	}
+	if gotRoles != "Member" {
+		t.Errorf("expected X-User-Roles=Member, got %q", gotRoles)
+	}
+}
+
+// Identity unavailable on a public endpoint must fail SOFT: the request is still
+// forwarded (200) without admin/roles, and the failure is negatively cached so
+// the second request does not hit identity again.
+func TestPlugin_PublicEndpoint_IdentityDown_FailsSoftAndCaches(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+	config.AppResolutionMode = "disabled"
+
+	var identityCalls int32
+	identityServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&identityCalls, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer identityServer.Close()
+
+	serviceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"plan_name": "free"})
+	}))
+	defer serviceServer.Close()
+
+	var gotIsAdmin string
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		gotIsAdmin = req.Header.Get("X-Is-Admin")
+		rw.WriteHeader(http.StatusOK)
+	})
+
+	plugin := &GatewayPlugin{
+		next:         next,
+		name:         "test",
+		config:       config,
+		snapshot:     setupTestSnapshot(),
+		identity:     newIdentityClient(identityServer.URL, 5*time.Second, nil),
+		planResolver: newPlanResolver(serviceServer.URL, 5*time.Second, nil),
+	}
+
+	token := createTestToken("test-secret", 9, "file-convert.online", time.Now().Add(time.Hour))
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rr := httptest.NewRecorder()
+		plugin.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("request %d: expected 200 when identity is down, got %d", i, rr.Code)
+		}
+		if gotIsAdmin != "" {
+			t.Errorf("request %d: expected no X-Is-Admin when identity is down, got %q", i, gotIsAdmin)
+		}
+	}
+	// Authz tries /authz then falls back to the admin-status call: 2 calls for
+	// the first request, none for the second (negative cache).
+	if n := atomic.LoadInt32(&identityCalls); n != 2 {
+		t.Errorf("expected identity to be called twice (authz + admin fallback) then negatively cached, got %d", n)
 	}
 }
 

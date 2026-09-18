@@ -10,7 +10,7 @@ Traefik middleware plugin for the FileConvert API gateway. Handles JWT authentic
 - **Registry snapshot** — polls service-service for endpoint metadata (access levels, rate limits per plan)
 - **Plan resolution** — resolves user's plan tier via service-service customer rate-tier endpoint, scoped per `(app_id, user_id)`
 - **App resolution (multi-app)** — derives a trusted `X-App-Id` from the request host via application-service's registry snapshot, strips any inbound client copy, and rejects unknown/inactive hosts (in `enforce` mode). Plan/admin/rate-limit/endpoint lookups are app-scoped.
-- **Downstream headers** — forwards `X-User-Id`, `X-User-Plan`, `X-Is-Admin`, `X-App-Id` to backend services
+- **Downstream headers** — forwards `X-User-Id`, `X-User-Plan`, `X-Is-Admin`, `X-User-Roles`, `X-App-Id` to backend services. `X-Is-Admin` / `X-User-Roles` are stamped on **every** authenticated request (public endpoints included), so a backend can offer admin-only behaviour on a public route; on public endpoints the identity lookup fails soft (headers absent, request still forwarded, failure negatively cached for 10s)
 
 ## Request Flow
 

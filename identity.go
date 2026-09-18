@@ -20,6 +20,11 @@ type IdentityClient struct {
 	mu         sync.RWMutex
 	adminCache map[string]adminCacheEntry
 	authzCache map[string]authzCacheEntry
+	// authzFailUntil is the negative cache for AuthzSoft: after a failed lookup
+	// the (app,user) key is not retried until this instant, so an identity
+	// outage costs one timed-out call per user per authzFailTTL instead of one
+	// per request.
+	authzFailUntil map[string]time.Time
 }
 
 type adminCacheEntry struct {
@@ -55,15 +60,46 @@ type authzCacheEntry struct {
 
 const adminCacheTTL = 60 * time.Second
 const authzCacheTTL = 60 * time.Second
+const authzFailTTL = 10 * time.Second
 
 func newIdentityClient(baseURL string, timeout time.Duration, log *pluginLogger) *IdentityClient {
 	return &IdentityClient{
-		baseURL:    baseURL,
-		client:     &http.Client{Timeout: timeout},
-		log:        log,
-		adminCache: make(map[string]adminCacheEntry),
-		authzCache: make(map[string]authzCacheEntry),
+		baseURL:        baseURL,
+		client:         &http.Client{Timeout: timeout},
+		log:            log,
+		adminCache:     make(map[string]adminCacheEntry),
+		authzCache:     make(map[string]authzCacheEntry),
+		authzFailUntil: make(map[string]time.Time),
 	}
+}
+
+// AuthzSoft is Authz for callers that must never fail because of it: it returns
+// nil instead of an error, and after a failure it stops retrying that
+// (app,user) for authzFailTTL. Successful lookups share Authz's positive cache.
+func (ic *IdentityClient) AuthzSoft(ctx context.Context, appID, userID string) *UserAuthz {
+	cacheKey := appID + "\x00" + userID
+
+	ic.mu.RLock()
+	until, failing := ic.authzFailUntil[cacheKey]
+	ic.mu.RUnlock()
+	if failing && time.Now().Before(until) {
+		return nil
+	}
+
+	authz, err := ic.Authz(ctx, appID, userID)
+	if err != nil {
+		ic.log.warnf("identity authz (soft) unavailable app_id=%s user_id=%s, forwarding without admin/roles: %v", appID, userID, err)
+		ic.mu.Lock()
+		ic.authzFailUntil[cacheKey] = time.Now().Add(authzFailTTL)
+		ic.mu.Unlock()
+		return nil
+	}
+	if failing {
+		ic.mu.Lock()
+		delete(ic.authzFailUntil, cacheKey)
+		ic.mu.Unlock()
+	}
+	return authz
 }
 
 // Authz resolves the user's per-app roles and permissions from

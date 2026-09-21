@@ -9,8 +9,9 @@ Traefik middleware plugin for the FileConvert API gateway. Handles JWT authentic
 - **Rate limiting** — fixed-window limiter backed by Redis, per-user or per-session, plan-aware limits from service-service snapshot
 - **Registry snapshot** — polls service-service for endpoint metadata (access levels, rate limits per plan)
 - **Plan resolution** — resolves user's plan tier via service-service customer rate-tier endpoint, scoped per `(app_id, user_id)`
-- **App resolution (multi-app)** — derives a trusted `X-App-Id` from the request host via application-service's registry snapshot, strips any inbound client copy, and rejects unknown/inactive hosts (in `enforce` mode). Plan/admin/rate-limit/endpoint lookups are app-scoped.
-- **Downstream headers** — forwards `X-User-Id`, `X-User-Plan`, `X-Is-Admin`, `X-User-Roles`, `X-App-Id` to backend services. `X-Is-Admin` / `X-User-Roles` are stamped on **every** authenticated request (public endpoints included), so a backend can offer admin-only behaviour on a public route; on public endpoints the identity lookup fails soft (headers absent, request still forwarded, failure negatively cached for 10s)
+- **App resolution (multi-app)** — derives a trusted `X-App-Id` from the request host via application-service's registry snapshot, strips any inbound client copy, and rejects unknown/inactive hosts (default `enforce` mode — see below). Plan/admin/rate-limit/endpoint lookups are app-scoped.
+- **Downstream headers** — forwards `X-User-Id`, `X-User-Plan`, `X-Is-Admin`, `X-User-Roles`, `X-App-Id`, `X-Api-Key-Uid` to backend services. All six are the configurable-name fields on `Config` (defaults set in `CreateConfig()`, `config.go`) and are **unconditionally stripped from the inbound request at `ServeHTTP` entry** (`plugin.go`, before any auth/routing logic runs) so a client-supplied copy can never survive — the plugin only ever re-stamps from data it validated itself. `X-Is-Admin` / `X-User-Roles` are stamped on **every JWT-authenticated request** (public endpoints included), so a backend can offer admin-only behaviour on a public route; on public endpoints the identity lookup fails soft (headers absent, request still forwarded, failure negatively cached for 10s). **The API-key auth path never sets `X-Is-Admin` / `X-User-Roles`** — see "API-key authentication" below.
+- **Unregistered endpoints pass through untouched** — if the request doesn't match any endpoint in the service-service registry snapshot (scoped to the resolved app), the plugin does **zero** enforcement (no auth check, no rate limiting, no header stamping) and forwards straight to the next handler, leaving 404 handling to Traefik's own routing. This is open-by-default for any path the registry doesn't know about — only registered endpoints get gateway enforcement.
 
 ## Request Flow
 
@@ -53,7 +54,7 @@ All options are configurable via the Traefik Middleware CRD (see `helm/middlewar
 | `appSnapshotRefreshInterval` | `30s` | Periodic full refresh of the app registry snapshot |
 | `appSnapshotVersionPollInterval` | `5s` | Cheap version poll interval for the app registry |
 | `appIdHeader` | `X-App-Id` | Trusted, gateway-stamped app id header (inbound copies stripped) |
-| `appResolutionMode` | `permissive` | `enforce` (unknown/inactive host → 403, cold registry → 503), `permissive` (pass through, no stamp), or `disabled` (skip resolution) |
+| `appResolutionMode` | `enforce` | `enforce` (**default**; unknown/inactive host → 403, cold registry → 503 — there are NO endpoints allowed without a resolved app_id), `permissive` (pass through, no stamp — local/debug only, do not use in production), or `disabled` (skip resolution — local single-app dev only) |
 | `trustForwardedHost` | `false` | When true resolve from `X-Forwarded-Host`; otherwise from `req.Host` |
 | `identityServiceUrl` | `http://identity-service:8080` | Identity service URL |
 | `identityVerifyUrl` | `http://identity-service:8080/internal/v1/api-keys/verify` | Internal API-key verify endpoint (contract §4). Not registry-registered; full in-cluster path. Verify call is capped at ≤2s; identity unreachable → 503 for key traffic only |
@@ -71,6 +72,37 @@ All options are configurable via the Traefik Middleware CRD (see `helm/middlewar
 | `corsAllowedHeaders` | `Origin Content-Type Accept Authorization X-Session-Id X-Device-Id X-App-Id` | Allowed request headers |
 | `corsAllowCredentials` | `true` | Sets `Access-Control-Allow-Credentials` |
 | `corsMaxAge` | `3600` | Preflight cache TTL in seconds |
+
+## API-key authentication (`apikey.go`)
+
+Requests may authenticate with a static API key instead of a JWT. Format:
+`fc_<env>_<uid>_<secret>` (a fixed 4-part, underscore-delimited credential). The key is read
+from the `X-Api-Key` header, or from `Authorization: Bearer` when its value starts with the
+`fc_` prefix (`X-Api-Key` takes precedence). When a key is present, the plugin takes this path
+**instead of** JWT parsing — it jumps straight to rate limiting, skipping JWT parsing,
+cross-app JWT replay checks, and RBAC.
+
+Verification is Redis cache-first (positive results cached 60s, negative 10s; only the key's
+hash is cached, never the raw secret), falling back to a `POST` to identity-service's internal
+`/internal/v1/api-keys/verify` endpoint with a hard ≤2s timeout. Any transport error **fails
+closed** (503) — it is never treated as open/anonymous.
+
+On success the plugin stamps `X-User-Id` and `X-Api-Key-Uid` (and `X-User-Plan` when the
+verify response includes one) and rate-limits by key uid. **It never sets `X-Is-Admin` or
+`X-User-Roles`** (explicit in-code comment at the stamping site: "Stamp trusted headers. NEVER
+X-Is-Admin / X-User-Roles on this path.") — API keys carry no admin capability, and
+permission-gated (RBAC) endpoints unconditionally deny API-key auth regardless of the key's
+owner.
+
+## Rate limiting (`ratelimit.go`)
+
+The limiter is a **fixed-window counter**, not a sliding-window or token-bucket algorithm:
+each check does a Redis `INCR` on the window's key followed by `EXPIRE` to seed the window
+TTL on first hit. This means a client can burst up to 2x the configured limit across a window
+boundary (e.g. near the end of one window and the start of the next) — a known fixed-window
+trade-off, not a bug. Limits are sourced per-endpoint-per-plan from the service-service
+registry snapshot, falling back to `defaultRateLimitRequests` / `defaultRateLimitDurationSeconds`
+when the endpoint has no plan-specific limit configured.
 
 ## Dual-issuer auth (Keycloak)
 

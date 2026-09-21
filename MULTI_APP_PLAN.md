@@ -117,7 +117,7 @@ service-service §4). `IdentityClient.IsAdmin(ctx, appID, userID)` — admin is 
 
 ## 8. Test plan (`plugin_test.go`, `helpers_test.go`, new `registry_test.go`)
 Harness: `setupTestAppRegistry()` with a pre-populated `byHost` map (bypass HTTP, mirror `setupTestSnapshot`);
-add `appRegistry` to all `GatewayPlugin` literals; map `example.com` or set `req.Host="fileconvert.online"`
+add `appRegistry` to all `GatewayPlugin` literals; map `example.com` or set `req.Host="file-convert.online"`
 so existing tests stay green; add `AppID: "fileconvert"` to test snapshot endpoints; fix `matchEndpoint` call sites.
 New tests: stamps `X-App-Id` on known host; strips inbound `X-App-Id` (matched + pass-through); unknown host
 enforce ⇒ 403; permissive ⇒ 200 no header; cold registry enforce ⇒ 503; inactive app ⇒ 403; per-app endpoint

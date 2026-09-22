@@ -2,6 +2,7 @@ package traefik_gateway_plugin
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -163,6 +164,10 @@ func parseKeycloakJWT(authHeader string, keys rsaKeyProvider, expectedIssuer, us
 			userID = v
 		}
 	}
+	// Every platform backend parses X-User-Id as a positive int64. Migrated
+	// fileconvert users carry that id in the claim; greenfield Keycloak users
+	// (scantinel) only have UUIDs, so derive a stable positive int64 from `sub`.
+	userID = numericUserID(userID, sub)
 
 	expAt := time.Time{}
 	if exp, _ := claims.GetExpirationTime(); exp != nil {
@@ -220,4 +225,56 @@ func keycloakRoles(claims jwt.MapClaims) []string {
 		appendRoles(realm["roles"])
 	}
 	return roles
+}
+
+// numericUserID returns the value stamped into X-User-Id for a Keycloak
+// principal. Backends (identity-service ids everywhere) require a positive
+// int64, so a claim that already is one (the luid of a migrated fileconvert
+// user) is used verbatim; anything else — the realm's `luid` mapper emits the
+// Keycloak UUID for greenfield users — is replaced by deriveUserID(sub).
+func numericUserID(claimValue, sub string) string {
+	if isPositiveInt(claimValue) {
+		return claimValue
+	}
+	return strconv.FormatUint(deriveUserID(sub), 10)
+}
+
+// isPositiveInt reports whether s is a base-10 integer in [1, MaxInt64].
+func isPositiveInt(s string) bool {
+	if s == "" || len(s) > 19 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	return err == nil && v > 0
+}
+
+// deriveUserID maps a Keycloak subject (UUID string) to a stable positive
+// int64: FNV-1a 64 of the UTF-8 bytes, top bit cleared, 0 mapped to 1.
+// Implemented inline (no hash/fnv import) so it runs unchanged under Yaegi.
+//
+// CONTRACT: scantinel-website performs the identical derivation when it calls
+// its services in-cluster with a self-stamped X-User-Id
+// (services/scantinel-website/src/lib/user-id.ts). Change both or neither;
+// the shared test vector is "00000000-0000-0000-0000-000000000000" →
+// 8950988243607919089.
+func deriveUserID(sub string) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
+	for i := 0; i < len(sub); i++ {
+		h ^= uint64(sub[i])
+		h *= prime64
+	}
+	h &= 0x7fffffffffffffff
+	if h == 0 {
+		h = 1
+	}
+	return h
 }

@@ -13,6 +13,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -151,8 +152,10 @@ func TestParseKeycloakJWT_ValidToken_SubFallback(t *testing.T) {
 	if !claims.Keycloak {
 		t.Error("expected Keycloak=true")
 	}
-	if claims.UserID != "3f8e9a2c-0000-4000-8000-c0ffee000001" {
-		t.Errorf("expected UserID=sub (no luid claim), got %q", claims.UserID)
+	// No luid claim → X-User-Id is DERIVED from sub (deriveUserID), never the
+	// raw UUID: every backend parses X-User-Id as a positive int64.
+	if want := strconv.FormatUint(deriveUserID("3f8e9a2c-0000-4000-8000-c0ffee000001"), 10); claims.UserID != want {
+		t.Errorf("expected UserID=derive(sub)=%s (no luid claim), got %q", want, claims.UserID)
 	}
 	if claims.AppID != "scantinel" {
 		t.Errorf("expected AppID=scantinel, got %q", claims.AppID)
@@ -716,5 +719,36 @@ func TestPlugin_HS256Fileconvert_UnchangedWithKeycloakConfigured(t *testing.T) {
 	plugin.ServeHTTP(rr, req)
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for RS256 token on HS256 app, got %d", rr.Code)
+	}
+}
+
+// The X-User-Id derivation is a cross-repo contract with scantinel-website
+// (src/lib/user-id.ts) — these vectors are asserted there too.
+func TestDeriveUserID_Vectors(t *testing.T) {
+	cases := map[string]uint64{
+		"00000000-0000-0000-0000-000000000000": 8950988243607919089,
+		"b3b1d0e2-6e41-4d2b-9d3c-1c9f2b4e5a6f": 8177468314355642305,
+		"7":                                    3414760188119455638,
+	}
+	for sub, want := range cases {
+		if got := deriveUserID(sub); got != want {
+			t.Errorf("deriveUserID(%q) = %d, want %d", sub, got, want)
+		}
+	}
+}
+
+func TestNumericUserID(t *testing.T) {
+	// migrated user: numeric luid is kept verbatim
+	if got := numericUserID("42", "b3b1d0e2-6e41-4d2b-9d3c-1c9f2b4e5a6f"); got != "42" {
+		t.Errorf("numeric claim must pass through, got %q", got)
+	}
+	// greenfield user: UUID luid → derived from sub
+	if got := numericUserID("b3b1d0e2-6e41-4d2b-9d3c-1c9f2b4e5a6f", "b3b1d0e2-6e41-4d2b-9d3c-1c9f2b4e5a6f"); got != "8177468314355642305" {
+		t.Errorf("uuid claim must be derived, got %q", got)
+	}
+	for _, bad := range []string{"", "0", "-5", "12a", "99999999999999999999"} {
+		if got := numericUserID(bad, "7"); got != "3414760188119455638" {
+			t.Errorf("claim %q must fall back to derive(sub), got %q", bad, got)
+		}
 	}
 }

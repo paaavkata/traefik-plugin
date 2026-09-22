@@ -192,3 +192,13 @@ The plugin expects a `GET /v1/user/:id/admin-status` endpoint on identity-servic
 ```json
 {"status": "success", "data": {"is_admin": true}}
 ```
+
+### X-User-Id for Keycloak principals
+
+Every platform backend parses `X-User-Id` as a positive int64. For Keycloak-issued tokens the
+plugin takes `keycloakUserIdClaim` (default `luid`) when it already is such an integer (migrated
+fileconvert users) and otherwise derives a stable positive int64 from `sub`: FNV-1a 64 over the
+UTF-8 bytes, top bit cleared, 0 → 1 (`deriveUserID` in `jwt.go`). **Cross-repo contract:**
+`scantinel-website` performs the identical derivation when it calls its services in-cluster
+(`src/lib/user-id.ts`); the shared vector is `00000000-0000-0000-0000-000000000000` →
+`8950988243607919089`. Change both or neither.

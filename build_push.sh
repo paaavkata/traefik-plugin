@@ -1,4 +1,9 @@
 #! /bin/bash
+#
+# DEPRECATED: this script is legacy and not used by CI.
+# The authoritative build/push pipeline is the Argo Workflows template at
+# infra/infra-gitops/argo-workflows/ci/traefik-plugin-ci.yaml.
+# Kept here for local/manual builds only; do not wire it back into CI.
 
 APP_NAME=traefik-gateway-plugin
 
@@ -28,5 +33,3 @@ docker buildx build \
     -t ${REGISTRY}/${REPO_PREFIX}/${APP_NAME}:${TAG} \
     -f Dockerfile \
     .
-
-echo "Replace the tag in the /storage/WorkspaceFileConvert/k8s_live_infra/AWS/eu-west-1/infra/ingress/traefik/values.yaml file with ${TAG}"

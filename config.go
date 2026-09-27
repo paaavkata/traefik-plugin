@@ -31,6 +31,14 @@ type Config struct {
 	// KeycloakApps is non-empty. Tokens with any other issuer are rejected (401).
 	KeycloakIssuer string `json:"keycloakIssuer" yaml:"keycloakIssuer"`
 
+	// KeycloakRealms binds individual app_ids to their OWN realm (issuer + JWKS),
+	// for apps that do not share the scalar keycloakIssuer/keycloakJwksUrl realm
+	// (e.g. fileconvert next to scantinel). An app listed here is a Keycloak app
+	// even when absent from KeycloakApps; an entry overrides the scalar realm for
+	// its app. Unknown to plugin builds older than this field (ignored there), so
+	// adding an entry is inert until the image carrying it is deployed.
+	KeycloakRealms []KeycloakRealm `json:"keycloakRealms" yaml:"keycloakRealms"`
+
 	// KeycloakUserIDClaim is the claim stamped into X-User-Id when present on the
 	// token, falling back to `sub`. Default "luid" — the legacy_user_id protocol
 	// mapper — so migrated users keep their numeric platform user id.
@@ -51,6 +59,10 @@ type Config struct {
 	// JWKSRefetchCooldown rate-limits on-demand re-fetches triggered by tokens with
 	// an unknown `kid`, so attacker-minted kids cannot flood Keycloak. Default "30s".
 	JWKSRefetchCooldown string `json:"jwksRefetchCooldown" yaml:"jwksRefetchCooldown"`
+
+	// UserUIDHeader carries the Keycloak `sub` (UUID) of the caller. Stamped ONLY
+	// on the Keycloak path; stripped from every inbound request. Default "X-User-Uid".
+	UserUIDHeader string `json:"userUidHeader" yaml:"userUidHeader"`
 
 	// Session ID header for anonymous rate-limiting
 	SessionIDHeader string `json:"sessionIdHeader" yaml:"sessionIdHeader"`
@@ -156,6 +168,18 @@ type Config struct {
 	CORSMaxAge           int      `json:"corsMaxAge" yaml:"corsMaxAge"`
 }
 
+// KeycloakRealm is one app_id -> realm binding (see Config.KeycloakRealms).
+type KeycloakRealm struct {
+	AppID   string `json:"appId" yaml:"appId"`
+	Issuer  string `json:"issuer" yaml:"issuer"`   // exact expected `iss`
+	JWKSURL string `json:"jwksUrl" yaml:"jwksUrl"` // JWKS or OIDC discovery URL
+	// AcceptLegacy also accepts legacy HS256 identity-service tokens for this app
+	// (validated on the unchanged jwtSecret path) — the migration window where
+	// old sessions and Keycloak sessions coexist. Dispatch is by the token's
+	// `alg` header: HS256 -> legacy validator, anything else -> this realm.
+	AcceptLegacy bool `json:"acceptLegacy" yaml:"acceptLegacy"`
+}
+
 // CreateConfig creates the default plugin configuration.
 func CreateConfig() *Config {
 	return &Config{
@@ -196,6 +220,7 @@ func CreateConfig() *Config {
 		UserPlanHeader:                  "X-User-Plan",
 		IsAdminHeader:                   "X-Is-Admin",
 		UserRolesHeader:                 "X-User-Roles",
+		UserUIDHeader:                   "X-User-Uid",
 		HTTPTimeout:                     "5s",
 		LogLevel:                        "info",
 	}

@@ -1,6 +1,8 @@
 package traefik_gateway_plugin
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -24,6 +26,7 @@ type TokenClaims struct {
 	Keycloak bool
 	IsAdmin  bool
 	Roles    []string
+	Subject  string // Keycloak `sub` (UUID) → X-User-Uid
 }
 
 // parseJWT extracts and validates a JWT from the Authorization header value.
@@ -192,6 +195,7 @@ func parseKeycloakJWT(authHeader string, keys rsaKeyProvider, expectedIssuer, us
 		Keycloak:  true,
 		IsAdmin:   isAdmin,
 		Roles:     roles,
+		Subject:   sub,
 	}, nil
 }
 
@@ -277,4 +281,26 @@ func deriveUserID(sub string) uint64 {
 		h = 1
 	}
 	return h
+}
+
+// tokenAlg returns the unverified `alg` of a bearer token's JOSE header ("" when
+// unparseable). Used ONLY to pick a validator on acceptLegacy realms; each
+// validator still pins its own algorithm, so a lying header just fails there.
+func tokenAlg(authHeader string) string {
+	tok := strings.TrimPrefix(authHeader, "Bearer ")
+	i := strings.IndexByte(tok, '.')
+	if i <= 0 {
+		return ""
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(tok[:i])
+	if err != nil {
+		return ""
+	}
+	var h struct {
+		Alg string `json:"alg"`
+	}
+	if json.Unmarshal(raw, &h) != nil {
+		return ""
+	}
+	return h.Alg
 }

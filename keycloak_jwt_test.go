@@ -22,7 +22,10 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-const testKeycloakIssuer = "https://auth.test/realms/platform"
+const (
+	testKeycloakIssuer = "https://auth.test/realms/platform"
+	testFCIssuer       = "https://auth.test/realms/fileconvert"
+)
 
 // --- JWKS test server -------------------------------------------------------
 
@@ -432,8 +435,24 @@ func TestBuildKeycloakAppSet(t *testing.T) {
 		KeycloakJWKSURL: "http://kc/certs",
 		KeycloakIssuer:  testKeycloakIssuer,
 	})
-	if err != nil || !apps["scantinel"] || len(apps) != 1 {
+	if r, ok := apps["scantinel"]; err != nil || !ok || len(apps) != 1 || r.Issuer != testKeycloakIssuer {
 		t.Fatalf("expected {scantinel}, got %v, %v", apps, err)
+	}
+
+	// keycloakRealms: adds an app with its own realm; incomplete entries are errors.
+	apps, err = buildKeycloakAppSet(&Config{
+		KeycloakApps:    []string{"scantinel"},
+		KeycloakJWKSURL: "http://kc/certs",
+		KeycloakIssuer:  testKeycloakIssuer,
+		KeycloakRealms:  []KeycloakRealm{{AppID: "fileconvert", Issuer: testFCIssuer, JWKSURL: "http://kc/fc/certs", AcceptLegacy: true}},
+	})
+	if err != nil || len(apps) != 2 || apps["fileconvert"].Issuer != testFCIssuer || !apps["fileconvert"].AcceptLegacy || apps["scantinel"].Issuer != testKeycloakIssuer {
+		t.Fatalf("expected two realms, got %v, %v", apps, err)
+	}
+	for _, bad := range []KeycloakRealm{{Issuer: testFCIssuer, JWKSURL: "u"}, {AppID: "fileconvert", JWKSURL: "u"}, {AppID: "fileconvert", Issuer: testFCIssuer}} {
+		if _, err := buildKeycloakAppSet(&Config{KeycloakRealms: []KeycloakRealm{bad}}); err == nil {
+			t.Fatalf("expected error for incomplete realm %+v", bad)
+		}
 	}
 }
 
@@ -504,9 +523,19 @@ func newDualIssuerPlugin(t *testing.T, ts *testJWKSServer, next http.Handler) *G
 	config.KeycloakJWKSURL = ts.srv.URL
 	config.KeycloakIssuer = testKeycloakIssuer
 
-	kcApps, err := buildKeycloakAppSet(config)
+	return wirePlugin(t, config, next, map[string]rsaKeyProvider{ts.srv.URL: ts.cache(0)})
+}
+
+// wirePlugin hand-wires a plugin from config, resolving each realm's JWKS URL to
+// an isolated test cache (keys = JWKS URLs) instead of the process-wide map.
+func wirePlugin(t *testing.T, config *Config, next http.Handler, caches map[string]rsaKeyProvider) *GatewayPlugin {
+	kcRealms, err := buildKeycloakAppSet(config)
 	if err != nil {
 		t.Fatalf("buildKeycloakAppSet: %v", err)
+	}
+	realms := map[string]*keycloakRealmRuntime{}
+	for app, r := range kcRealms {
+		realms[app] = &keycloakRealmRuntime{issuer: r.Issuer, jwks: caches[r.JWKSURL], acceptLegacy: r.AcceptLegacy}
 	}
 	return &GatewayPlugin{
 		next:           next,
@@ -516,8 +545,7 @@ func newDualIssuerPlugin(t *testing.T, ts *testJWKSServer, next http.Handler) *G
 		appRegistry:    setupDualAppRegistry(),
 		identity:       newIdentityClient("http://localhost:9999", 1*time.Second, nil),
 		planResolver:   newPlanResolver("http://localhost:9999", 1*time.Second, nil),
-		jwks:           ts.cache(0),
-		keycloakApps:   kcApps,
+		keycloakRealms: realms,
 		keycloakLeeway: time.Duration(config.KeycloakClockSkewSeconds) * time.Second,
 	}
 }
@@ -749,6 +777,154 @@ func TestNumericUserID(t *testing.T) {
 	for _, bad := range []string{"", "0", "-5", "12a", "99999999999999999999"} {
 		if got := numericUserID(bad, "7"); got != "3414760188119455638" {
 			t.Errorf("claim %q must fall back to derive(sub), got %q", bad, got)
+		}
+	}
+}
+
+// --- per-app realms (scantinel + fileconvert on different realms) ------------
+
+// newTwoRealmPlugin: scantinel on the scalar realm (ts1), fileconvert on its own
+// realm (ts2) via keycloakRealms, optionally accepting legacy HS256 tokens.
+func newTwoRealmPlugin(t *testing.T, ts1, ts2 *testJWKSServer, acceptLegacy bool, next http.Handler) *GatewayPlugin {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+	config.KeycloakApps = []string{"scantinel"}
+	config.KeycloakJWKSURL = ts1.srv.URL
+	config.KeycloakIssuer = testKeycloakIssuer
+	config.KeycloakRealms = []KeycloakRealm{{AppID: "fileconvert", Issuer: testFCIssuer, JWKSURL: ts2.srv.URL, AcceptLegacy: acceptLegacy}}
+	return wirePlugin(t, config, next, map[string]rsaKeyProvider{ts1.srv.URL: ts1.cache(0), ts2.srv.URL: ts2.cache(0)})
+}
+
+func fcClaims() jwt.MapClaims {
+	c := keycloakClaims(time.Now().Add(time.Hour))
+	c["iss"] = testFCIssuer
+	c["azp"] = "fileconvert-web"
+	c["app_id"] = "fileconvert"
+	c["luid"] = "42"
+	c["realm_access"] = map[string]interface{}{"roles": []interface{}{"admin"}}
+	return c
+}
+
+func serve(p *GatewayPlugin, url, token string, hdr map[string]string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, url, nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+	return rr
+}
+
+const (
+	fcURL   = "http://fileconvert.online/api/conversion/v1/convert"
+	scanURL = "http://scantinel.ai/api/scan/v1/scans"
+)
+
+func TestPlugin_TwoRealms_EachTokenOnlyValidOnItsRealm(t *testing.T) {
+	ts1, ts2 := newTestJWKSServer(t), newTestJWKSServer(t)
+	k1, k2 := ts1.newKey("kid-s"), ts2.newKey("kid-f")
+
+	var got http.Header
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		got = req.Header.Clone()
+		rw.WriteHeader(http.StatusOK)
+	})
+	p := newTwoRealmPlugin(t, ts1, ts2, false, next)
+
+	fcTok := mintKeycloakToken(t, k2, "kid-f", fcClaims())
+	scTok := mintKeycloakToken(t, k1, "kid-s", keycloakClaims(time.Now().Add(time.Hour)))
+
+	// fileconvert token on fileconvert host → 200, headers from its realm.
+	if rr := serve(p, fcURL, fcTok, map[string]string{"X-User-Uid": "spoof"}); rr.Code != http.StatusOK {
+		t.Fatalf("fc token on fc host: expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if got.Get("X-User-Id") != "42" || got.Get("X-App-Id") != "fileconvert" || got.Get("X-Is-Admin") != "true" {
+		t.Errorf("unexpected fc headers: id=%q app=%q admin=%q", got.Get("X-User-Id"), got.Get("X-App-Id"), got.Get("X-Is-Admin"))
+	}
+	if got.Get("X-User-Uid") != "3f8e9a2c-0000-4000-8000-c0ffee000001" {
+		t.Errorf("expected X-User-Uid=sub, got %q", got.Get("X-User-Uid"))
+	}
+
+	// scantinel token still valid on scantinel host.
+	if rr := serve(p, scanURL, scTok, nil); rr.Code != http.StatusOK {
+		t.Fatalf("scantinel token on scantinel host: expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// Cross-realm: each token rejected on the other realm's host (unknown kid /
+	// issuer mismatch), even if its app_id claim were forged to match.
+	if rr := serve(p, scanURL, fcTok, nil); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("fc token on scantinel host: expected 401, got %d", rr.Code)
+	}
+	if rr := serve(p, fcURL, scTok, nil); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("scantinel token on fc host: expected 401, got %d", rr.Code)
+	}
+	forged := keycloakClaims(time.Now().Add(time.Hour))
+	forged["app_id"] = "fileconvert"
+	if rr := serve(p, fcURL, mintKeycloakToken(t, k1, "kid-s", forged), nil); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("scantinel-realm token with app_id=fileconvert on fc host: expected 401, got %d", rr.Code)
+	}
+	// Same key material but wrong issuer (realm confusion) → 401.
+	wrongIss := fcClaims()
+	wrongIss["iss"] = testKeycloakIssuer
+	if rr := serve(p, fcURL, mintKeycloakToken(t, k2, "kid-f", wrongIss), nil); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("fc key + scantinel issuer: expected 401, got %d", rr.Code)
+	}
+}
+
+func TestPlugin_TwoRealms_LegacyHS256(t *testing.T) {
+	ts1, ts2 := newTestJWKSServer(t), newTestJWKSServer(t)
+	ts1.newKey("kid-s")
+	k2 := ts2.newKey("kid-f")
+	var got http.Header
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		got = req.Header.Clone()
+		rw.WriteHeader(http.StatusOK)
+	})
+	legacy := createTestTokenWithApp("test-secret", 7, "file-convert.online", "fileconvert", time.Now().Add(time.Hour))
+
+	// acceptLegacy=false: fileconvert is Keycloak-only → HS256 rejected.
+	strict := newTwoRealmPlugin(t, ts1, ts2, false, next)
+	if rr := serve(strict, fcURL, legacy, nil); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("HS256 on keycloak-only fc: expected 401, got %d", rr.Code)
+	}
+
+	// acceptLegacy=true: both token kinds work on the fc host.
+	dual := newTwoRealmPlugin(t, ts1, ts2, true, next)
+	if rr := serve(dual, fcURL, legacy, map[string]string{"X-User-Uid": "spoof"}); rr.Code != http.StatusOK {
+		t.Fatalf("HS256 on dual fc: expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if got.Get("X-User-Id") != "7" || got.Get("X-User-Uid") != "" {
+		t.Errorf("legacy path: X-User-Id=%q (want 7), X-User-Uid=%q (want empty)", got.Get("X-User-Id"), got.Get("X-User-Uid"))
+	}
+	if rr := serve(dual, fcURL, mintKeycloakToken(t, k2, "kid-f", fcClaims()), nil); rr.Code != http.StatusOK {
+		t.Fatalf("RS256 on dual fc: expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	// Wrong-secret HS256 still fails on the legacy validator.
+	if rr := serve(dual, fcURL, createTestTokenWithApp("wrong", 7, "file-convert.online", "fileconvert", time.Now().Add(time.Hour)), nil); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("bad HS256 on dual fc: expected 401, got %d", rr.Code)
+	}
+	// acceptLegacy on fileconvert must not open the legacy path for scantinel.
+	if rr := serve(dual, scanURL, createTestTokenWithApp("test-secret", 7, "file-convert.online", "scantinel", time.Now().Add(time.Hour)), nil); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("HS256 on scantinel host: expected 401, got %d", rr.Code)
+	}
+	// alg=none / garbage header on the dual app goes to the RS256 validator → 401.
+	if rr := serve(dual, fcURL, "eyJhbGciOiJub25lIn0.e30.", nil); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("alg=none on dual fc: expected 401, got %d", rr.Code)
+	}
+}
+
+func TestTokenAlg(t *testing.T) {
+	legacy := createTestTokenWithApp("s", 1, "i", "a", time.Now().Add(time.Hour))
+	if a := tokenAlg("Bearer " + legacy); a != "HS256" {
+		t.Errorf("want HS256, got %q", a)
+	}
+	for _, bad := range []string{"", "Bearer ", "Bearer x", "Bearer !!!.e30.x"} {
+		if a := tokenAlg(bad); a != "" {
+			t.Errorf("tokenAlg(%q) = %q, want empty", bad, a)
 		}
 	}
 }

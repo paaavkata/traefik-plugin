@@ -23,11 +23,17 @@ type GatewayPlugin struct {
 	planResolver *PlanResolver
 	apiKeys      *APIKeyVerifier
 
-	// Dual-issuer (Keycloak) state. keycloakApps empty ⇒ every request takes the
-	// legacy HS256 path exactly as before.
-	jwks           *JWKSCache
-	keycloakApps   map[string]bool
+	// Dual-issuer (Keycloak) state: app_id -> its realm. Empty ⇒ every request
+	// takes the legacy HS256 path exactly as before.
+	keycloakRealms map[string]*keycloakRealmRuntime
 	keycloakLeeway time.Duration
+}
+
+// keycloakRealmRuntime is a validated realm binding with its JWKS key source.
+type keycloakRealmRuntime struct {
+	issuer       string
+	jwks         rsaKeyProvider
+	acceptLegacy bool
 }
 
 // New creates a new plugin instance.
@@ -75,16 +81,21 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	plugin.identity = newIdentityClient(config.IdentityServiceURL, httpTimeout, plog)
 
 	// Keycloak dual-issuer path (additive; inert when keycloakApps is empty).
-	kcApps, err := buildKeycloakAppSet(config)
+	kcRealms, err := buildKeycloakAppSet(config)
 	if err != nil {
 		return nil, err
 	}
-	plugin.keycloakApps = kcApps
 	plugin.keycloakLeeway = time.Duration(config.KeycloakClockSkewSeconds) * time.Second
-	if len(kcApps) > 0 {
-		jwksRefresh := parseDuration(config.JWKSRefreshInterval, 10*time.Minute)
-		jwksCooldown := parseDuration(config.JWKSRefetchCooldown, 30*time.Second)
-		plugin.jwks = getSharedJWKSCache(config.KeycloakJWKSURL, httpTimeout, jwksRefresh, jwksCooldown, plog)
+	plugin.keycloakRealms = make(map[string]*keycloakRealmRuntime, len(kcRealms))
+	jwksRefresh := parseDuration(config.JWKSRefreshInterval, 10*time.Minute)
+	jwksCooldown := parseDuration(config.JWKSRefetchCooldown, 30*time.Second)
+	for app, r := range kcRealms {
+		// One shared cache per JWKS URL (apps on the same realm share it).
+		plugin.keycloakRealms[app] = &keycloakRealmRuntime{
+			issuer:       r.Issuer,
+			jwks:         getSharedJWKSCache(r.JWKSURL, httpTimeout, jwksRefresh, jwksCooldown, plog),
+			acceptLegacy: r.AcceptLegacy,
+		}
 	}
 
 	// Plan resolver
@@ -111,44 +122,52 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	return plugin, nil
 }
 
-// buildKeycloakAppSet validates the Keycloak config block and returns the set of
-// app_ids that authenticate via Keycloak. Empty list ⇒ Keycloak path disabled.
-func buildKeycloakAppSet(config *Config) (map[string]bool, error) {
-	apps := make(map[string]bool, len(config.KeycloakApps))
+// buildKeycloakAppSet validates the Keycloak config and returns app_id -> realm.
+// Scalar keycloakApps use the scalar keycloakIssuer/keycloakJwksUrl realm;
+// keycloakRealms entries bind (or override) an app to its own realm. Empty map ⇒
+// Keycloak path disabled. Misconfiguration is a hard error (never a silent
+// fallback to the shared-secret path).
+func buildKeycloakAppSet(config *Config) (map[string]KeycloakRealm, error) {
+	realms := make(map[string]KeycloakRealm)
 	for _, a := range config.KeycloakApps {
 		a = strings.TrimSpace(a)
-		if a != "" {
-			apps[a] = true
+		if a == "" {
+			continue
 		}
-	}
-	if len(apps) > 0 {
 		if config.KeycloakJWKSURL == "" {
 			return nil, fmt.Errorf("traefik-gateway-plugin: keycloakApps is set but keycloakJwksUrl is empty")
 		}
 		if config.KeycloakIssuer == "" {
 			return nil, fmt.Errorf("traefik-gateway-plugin: keycloakApps is set but keycloakIssuer is empty")
 		}
+		realms[a] = KeycloakRealm{AppID: a, Issuer: config.KeycloakIssuer, JWKSURL: config.KeycloakJWKSURL}
 	}
-	return apps, nil
+	for _, r := range config.KeycloakRealms {
+		r.AppID = strings.TrimSpace(r.AppID)
+		if r.AppID == "" || r.Issuer == "" || r.JWKSURL == "" {
+			return nil, fmt.Errorf("traefik-gateway-plugin: keycloakRealms entry needs appId, issuer and jwksUrl (got appId=%q)", r.AppID)
+		}
+		realms[r.AppID] = r
+	}
+	return realms, nil
 }
 
-// isKeycloakApp reports whether the resolved app authenticates via Keycloak.
-// Unresolved app_id ("" — permissive/disabled modes) always uses the legacy path.
-func (p *GatewayPlugin) isKeycloakApp(appID string) bool {
-	return appID != "" && p.keycloakApps[appID]
+// keycloakRealmFor returns the realm the resolved app authenticates against, or
+// nil for legacy (HS256) apps. Unresolved app_id ("" — permissive/disabled modes)
+// always uses the legacy path.
+func (p *GatewayPlugin) keycloakRealmFor(appID string) *keycloakRealmRuntime {
+	if appID == "" {
+		return nil
+	}
+	return p.keycloakRealms[appID]
 }
 
-// parseKeycloakAuth validates a bearer token on the Keycloak RS256/JWKS path.
-// Fails closed if the JWKS cache was never configured (misconfiguration must not
-// silently fall back to the shared-secret path).
-func (p *GatewayPlugin) parseKeycloakAuth(authHeader string) (*TokenClaims, error) {
+// parseKeycloakAuth validates a bearer token against the app's realm (RS256/JWKS).
+func (p *GatewayPlugin) parseKeycloakAuth(realm *keycloakRealmRuntime, authHeader string) (*TokenClaims, error) {
 	if authHeader == "" {
 		return nil, nil // anonymous — same contract as parseJWT
 	}
-	if p.jwks == nil {
-		return nil, fmt.Errorf("keycloak validation not configured")
-	}
-	return parseKeycloakJWT(authHeader, p.jwks, p.config.KeycloakIssuer, p.config.KeycloakUserIDClaim, p.keycloakLeeway, p.config.KeycloakAdminRoles)
+	return parseKeycloakJWT(authHeader, realm.jwks, realm.issuer, p.config.KeycloakUserIDClaim, p.keycloakLeeway, p.config.KeycloakAdminRoles)
 }
 
 // authzFromTokenRoles synthesizes a UserAuthz from Keycloak token roles without an
@@ -237,6 +256,7 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	req.Header.Del(p.config.IsAdminHeader)
 	req.Header.Del(p.config.UserRolesHeader)
 	req.Header.Del(p.config.ApiKeyUidHeader)
+	req.Header.Del(p.config.UserUIDHeader)
 
 	// 1a. Resolve app_id from the request host; stamp the trusted header on success.
 	var appID string
@@ -290,16 +310,19 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	// 2. Parse JWT (if present). Dual-issuer dispatch by the host-resolved app_id:
-	// Keycloak apps → RS256 + JWKS + Keycloak issuer; everything else → the legacy
-	// HS256 shared-secret path, byte-for-byte unchanged. Because each path pins its
+	// Keycloak apps → RS256 + JWKS + that app's realm issuer; everything else → the
+	// legacy HS256 shared-secret path, byte-for-byte unchanged. A realm with
+	// acceptLegacy also routes HS256-headed tokens to the legacy validator
+	// (migration window); the header only picks the validator, never the verdict. Because each path pins its
 	// algorithm (WithValidMethods), a token from one issuer can never validate on
 	// the other's path (alg-confusion guard in both directions).
 	var claims *TokenClaims
 	if !p.config.DisableAuth {
 		authHeader := req.Header.Get(p.config.JWTHeaderKey)
 		var err error
-		if p.isKeycloakApp(appID) {
-			claims, err = p.parseKeycloakAuth(authHeader)
+		realm := p.keycloakRealmFor(appID)
+		if realm != nil && !(realm.acceptLegacy && tokenAlg(authHeader) == "HS256") {
+			claims, err = p.parseKeycloakAuth(realm, authHeader)
 		} else {
 			claims, err = parseJWT(authHeader, p.config.JWTSecret, p.config.JWTIssuer)
 		}
@@ -396,6 +419,7 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			// Keycloak tokens carry admin/roles directly (frozen header contract:
 			// same X-Is-Admin/X-User-Roles the identity-service path stamps).
 			p.stampAuthzHeaders(req, authzFromTokenRoles(claims))
+			req.Header.Set(p.config.UserUIDHeader, claims.Subject)
 		} else if !authzStamped {
 			// Legacy tokens: stamp the same admin/roles contract on EVERY
 			// authenticated request, not only on permission-gated endpoints, so

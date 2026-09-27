@@ -449,6 +449,28 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		planName = p.config.DefaultPlanName
 	}
 
+	// 4b. Owner gate (registry owner_param): a regular user may address only
+	// their own id; an admin any id. Admin comes from the X-Is-Admin header this
+	// plugin stamped above (inbound copies were stripped at entry). Fail-soft
+	// admin lookup is safe here: unknown admin ⇒ owner equality enforced.
+	if ep.OwnerParam != "" {
+		if claims == nil {
+			writeJSON(rw, http.StatusUnauthorized, map[string]string{
+				"error":   "unauthorized",
+				"message": "authentication required for this endpoint",
+			})
+			return
+		}
+		if req.Header.Get(p.config.IsAdminHeader) != "true" && !ownerMatches(extractOwner(ep, req), claims.UserID, claims.Subject) {
+			p.log.warnf("owner gate denied user_id=%s path=%s owner_param=%s", claims.UserID, req.URL.Path, ep.OwnerParam)
+			writeJSON(rw, http.StatusForbidden, map[string]string{
+				"error":   "forbidden",
+				"message": "not allowed to access another user's resource",
+			})
+			return
+		}
+	}
+
 	// 5. Rate limiting
 	if !p.config.DisableRateLimit && p.rateLimiter != nil {
 		limit, window := p.resolveRateLimit(ep, planName)
@@ -550,6 +572,16 @@ func (p *GatewayPlugin) serveAPIKey(rw http.ResponseWriter, req *http.Request, e
 		return
 	}
 
+	// Owner gate: keys never carry admin, so no bypass — own id only.
+	if ep.OwnerParam != "" && !ownerMatches(extractOwner(ep, req), res.UserID, "") {
+		p.log.warnf("api-key owner gate denied path=%s uid=%s owner_param=%s", req.URL.Path, key.uid, ep.OwnerParam)
+		writeJSON(rw, http.StatusForbidden, map[string]string{
+			"error":   "forbidden",
+			"message": "not allowed to access another user's resource",
+		})
+		return
+	}
+
 	// Stamp trusted headers. NEVER X-Is-Admin / X-User-Roles on this path.
 	req.Header.Set(p.config.UserIDHeader, res.UserID)
 	if res.Plan != "" {
@@ -624,4 +656,31 @@ func (p *GatewayPlugin) resolveRateLimit(ep *compiledEndpoint, planName string) 
 		return rl.Requests, rl.DurationSeconds
 	}
 	return p.config.DefaultRateLimitRequests, p.config.DefaultRateLimitDurationSeconds
+}
+
+// extractOwner returns the resource-owner id named by ep.OwnerParam: a named
+// capture of the endpoint regex ("path:<name>") or a query parameter
+// ("query:<name>"). "" when absent or the descriptor is malformed.
+func extractOwner(ep *compiledEndpoint, req *http.Request) string {
+	kind, name, ok := strings.Cut(ep.OwnerParam, ":")
+	if !ok || name == "" {
+		return ""
+	}
+	switch kind {
+	case "path":
+		i := ep.regex.SubexpIndex(name)
+		if m := ep.regex.FindStringSubmatch(req.URL.Path); i > 0 && i < len(m) {
+			return strings.TrimSpace(m[i])
+		}
+	case "query":
+		return strings.TrimSpace(req.URL.Query().Get(name))
+	}
+	return ""
+}
+
+// ownerMatches reports whether the addressed owner id is the caller's own: the
+// legacy/luid X-User-Id or, when present, the Keycloak sub (X-User-Uid).
+// Fail-closed: an empty owner never matches.
+func ownerMatches(owner, userID, userUID string) bool {
+	return owner != "" && (owner == userID || (userUID != "" && owner == userUID))
 }

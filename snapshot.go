@@ -44,9 +44,12 @@ type SnapshotEndpointDTO struct {
 	AccessLevel string `json:"access_level"`
 	// RequiredPermission is the RBAC v2 permission tag callers must hold
 	// (empty = none). The admin access level implies config.AdminPermission.
-	RequiredPermission string                    `json:"required_permission"`
-	Tags               []string                  `json:"tags"`
-	RateLimits         map[string]RateLimitValue `json:"rate_limits"`
+	RequiredPermission string `json:"required_permission"`
+	// OwnerParam names where the resource-owner user id sits: "path:<capture>"
+	// (named group in PathRegex) or "query:<name>". Empty = no owner gate.
+	OwnerParam string                    `json:"owner_param"`
+	Tags       []string                  `json:"tags"`
+	RateLimits map[string]RateLimitValue `json:"rate_limits"`
 }
 
 type RateLimitValue struct {

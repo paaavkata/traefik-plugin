@@ -27,6 +27,7 @@ type TokenClaims struct {
 	IsAdmin  bool
 	Roles    []string
 	Subject  string // Keycloak `sub` (UUID) → X-User-Uid
+	Email    string // Keycloak `email`, only when `email_verified` is true
 }
 
 // parseJWT extracts and validates a JWT from the Authorization header value.
@@ -187,6 +188,11 @@ func parseKeycloakJWT(authHeader string, keys rsaKeyProvider, expectedIssuer, us
 		}
 	}
 
+	email := ""
+	if v, _ := claims["email_verified"].(bool); v {
+		email, _ = claims["email"].(string)
+	}
+
 	return &TokenClaims{
 		UserID:    userID,
 		Issuer:    iss,
@@ -196,6 +202,7 @@ func parseKeycloakJWT(authHeader string, keys rsaKeyProvider, expectedIssuer, us
 		IsAdmin:   isAdmin,
 		Roles:     roles,
 		Subject:   sub,
+		Email:     email,
 	}, nil
 }
 

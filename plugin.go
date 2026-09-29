@@ -257,6 +257,9 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	req.Header.Del(p.config.UserRolesHeader)
 	req.Header.Del(p.config.ApiKeyUidHeader)
 	req.Header.Del(p.config.UserUIDHeader)
+	if p.config.UserEmailHeader != "" {
+		req.Header.Del(p.config.UserEmailHeader)
+	}
 
 	// 1a. Resolve app_id from the request host; stamp the trusted header on success.
 	var appID string
@@ -420,6 +423,9 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			// same X-Is-Admin/X-User-Roles the identity-service path stamps).
 			p.stampAuthzHeaders(req, authzFromTokenRoles(claims))
 			req.Header.Set(p.config.UserUIDHeader, claims.Subject)
+			if p.config.UserEmailHeader != "" && claims.Email != "" {
+				req.Header.Set(p.config.UserEmailHeader, claims.Email)
+			}
 		} else if !authzStamped {
 			// Legacy tokens: stamp the same admin/roles contract on EVERY
 			// authenticated request, not only on permission-gated endpoints, so

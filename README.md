@@ -42,6 +42,7 @@ All options are configurable via the Traefik Middleware CRD (see `helm/middlewar
 | `keycloakIssuer` | — | Expected `iss`, byte-for-byte (realm public URL). Required when `keycloakApps` is set |
 | `keycloakRealms` | `[]` | Per-app realms: list of `{appId, issuer, jwksUrl, acceptLegacy}`. Makes `appId` a Keycloak app validated against ITS realm (overrides the scalar realm for that app). `acceptLegacy: true` also accepts legacy HS256 identity-service tokens for that app (dispatch by token `alg`; each validator still pins its algorithm) — the migration window. Older plugin builds ignore this key |
 | `userUidHeader` | `X-User-Uid` | Stamped with the Keycloak `sub` (UUID) on the Keycloak path only; always stripped inbound |
+| `userEmailHeader` | _(empty = inert)_ | When set (e.g. `X-User-Email`): always stripped inbound; stamped only on the Keycloak path from `email` when `email_verified` is `true`. Enabled per env in the Middleware |
 | `keycloakUserIdClaim` | `luid` | Claim stamped into `X-User-Id` (legacy_user_id mapper), falling back to `sub` |
 | `keycloakAdminRoles` | `admin, owner` | Token roles (azp client roles + realm roles) implying `X-Is-Admin: true` |
 | `keycloakClockSkewSeconds` | `30` | Leeway for exp/nbf/iat validation on the Keycloak path |

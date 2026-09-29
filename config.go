@@ -64,6 +64,12 @@ type Config struct {
 	// on the Keycloak path; stripped from every inbound request. Default "X-User-Uid".
 	UserUIDHeader string `json:"userUidHeader" yaml:"userUidHeader"`
 
+	// UserEmailHeader, when set (e.g. "X-User-Email"), is stripped from every
+	// inbound request and re-stamped ONLY on the Keycloak path from a verified
+	// token (`email` with `email_verified: true`). Empty (default) = inert, the
+	// header is left untouched, so enabling it is a per-env Middleware change.
+	UserEmailHeader string `json:"userEmailHeader" yaml:"userEmailHeader"`
+
 	// Session ID header for anonymous rate-limiting
 	SessionIDHeader string `json:"sessionIdHeader" yaml:"sessionIdHeader"`
 

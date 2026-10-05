@@ -723,3 +723,70 @@ func TestPlugin_APIKey_JWTPathUnaffected(t *testing.T) {
 		t.Errorf("JWT path must not stamp X-Api-Key-Uid, got %q", gotUID)
 	}
 }
+
+// ── Redis outage tolerance ───────────────────────────────────────────────────────
+
+// A Redis that is down at startup must not fail client construction (Traefik
+// would drop every route using the middleware), and the client must reconnect
+// by itself once Redis is back.
+func TestRespRedis_DownAtStartThenReconnects(t *testing.T) {
+	fake := newFakeRedisServer(t)
+	addr := fake.addr()
+	fake.close() // nothing listens on addr now
+
+	r, err := dialRedis(context.Background(), addr, "", 0, nil)
+	if err != nil {
+		t.Fatalf("dialRedis must tolerate an unreachable Redis, got: %v", err)
+	}
+	defer r.Close()
+	if _, _, err := r.get(context.Background(), "k"); err == nil {
+		t.Fatal("expected an error while Redis is down")
+	}
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Skipf("could not rebind %s: %v", addr, err)
+	}
+	back := &fakeRedisServer{ln: ln, store: map[string]string{"k": "v"}}
+	go back.serve()
+	defer back.close()
+
+	deadline := time.Now().Add(redisRedialBackoff + 3*time.Second)
+	for {
+		v, ok, err := r.get(context.Background(), "k")
+		if err == nil {
+			if !ok || v != "v" {
+				t.Fatalf("got %q ok=%v after reconnect", v, ok)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("client did not reconnect: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// A connection that dies mid-life (Redis restart) is replaced on a later command.
+func TestRespRedis_ReconnectsAfterConnectionLoss(t *testing.T) {
+	fake := newFakeRedisServer(t)
+	defer fake.close()
+	r, err := dialRedis(context.Background(), fake.addr(), "", 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if err := r.setEX(context.Background(), "k", "v", 60); err != nil {
+		t.Fatalf("set before loss: %v", err)
+	}
+
+	r.conn.Close() // simulate the server side going away
+
+	if _, _, err := r.get(context.Background(), "k"); err == nil {
+		t.Fatal("expected the first command on a dead connection to fail")
+	}
+	v, ok, err := r.get(context.Background(), "k")
+	if err != nil || !ok || v != "v" {
+		t.Fatalf("after reconnect: v=%q ok=%v err=%v", v, ok, err)
+	}
+}

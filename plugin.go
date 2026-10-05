@@ -102,17 +102,16 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	plugin.planResolver = newPlanResolver(config.ServiceServiceURL, httpTimeout, plog)
 
 	// API-key verifier (contract §4). Uses a dedicated Redis connection for its
-	// positive/negative verify cache so it works independently of rate-limiting. A
-	// Redis dial failure is non-fatal for the key path (cache disabled → every key
-	// request hits identity-service directly); it only becomes fatal above when
-	// rate-limiting itself needs Redis.
+	// positive/negative verify cache so it works independently of rate-limiting.
+	// While Redis is unreachable the cache read/write fails and every key request
+	// hits identity-service directly; the client reconnects once Redis is back.
 	var apiKeyCache *respRedis
 	if config.RedisURL != "" {
 		dialCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		c, err := dialRedis(dialCtx, config.RedisURL, config.RedisPassword, config.RedisDB, plog)
 		cancel()
 		if err != nil {
-			plog.warnf("api-key cache redis init failed (cache disabled, verifying every request): %v", err)
+			plog.warnf("api-key cache redis config invalid (cache disabled, verifying every request): %v", err)
 		} else {
 			apiKeyCache = c
 		}

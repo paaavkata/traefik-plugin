@@ -17,9 +17,10 @@ func newRateLimiter(redisURL, password, prefix string, db int, log *pluginLogger
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
+	// Fails only on an unusable URL; an unreachable Redis is retried on use.
 	client, err := dialRedis(ctx, redisURL, password, db, log)
 	if err != nil {
-		return nil, fmt.Errorf("redis dial failed: %w", err)
+		return nil, fmt.Errorf("redis config invalid: %w", err)
 	}
 
 	return &RateLimiter{

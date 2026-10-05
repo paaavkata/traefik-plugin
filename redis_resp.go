@@ -15,58 +15,111 @@ import (
 )
 
 // respRedis is a tiny Redis RESP2 client (no unsafe / cgo), sufficient for rate limiting.
+//
+// The connection is established lazily and re-established after any I/O
+// error, so a Redis restart never needs a Traefik reload: commands fail (the
+// callers fail open) until Redis is back, then the next command reconnects.
 type respRedis struct {
+	addr   string
+	useTLS bool
+	pwd    string
+	db     int
+
 	conn net.Conn
 	rd   *bufio.Reader
 	bw   *bufio.Writer
 	mu   sync.Mutex
 	log  *pluginLogger
+
+	// retryAt is the earliest time of the next dial after a failed one, so a
+	// Redis outage costs one dial per backoff period, not one per request.
+	retryAt time.Time
 }
 
+const (
+	redisDialTimeout   = time.Second
+	redisRedialBackoff = 2 * time.Second
+)
+
+// redisReplyError is an error reply from Redis ("-ERR ..."). The connection is
+// still usable after it, unlike after an I/O or protocol error.
+type redisReplyError string
+
+func (e redisReplyError) Error() string { return "redis: " + string(e) }
+
+// dialRedis returns a client for redisURL. Only an unusable URL is an error:
+// an unreachable Redis is logged and retried on later commands, because
+// failing here would make Traefik drop every route that uses the middleware.
 func dialRedis(ctx context.Context, redisURL, password string, db int, log *pluginLogger) (*respRedis, error) {
 	addr, useTLS, pwd, err := parseRedisURL(redisURL, password)
 	if err != nil {
 		return nil, err
 	}
+	r := &respRedis{addr: addr, useTLS: useTLS, pwd: pwd, db: db, log: log}
+
+	r.mu.Lock()
+	err = r.connect(ctx)
+	r.mu.Unlock()
+	if err != nil {
+		log.warnf("redis unreachable at startup addr=%s (will retry on use): %v", addr, err)
+	}
+	return r, nil
+}
+
+// connect dials and runs the AUTH/SELECT/PING handshake. Caller holds r.mu.
+func (r *respRedis) connect(ctx context.Context) error {
+	if time.Now().Before(r.retryAt) {
+		return fmt.Errorf("redis unavailable (next dial after %s)", r.retryAt.Format(time.RFC3339))
+	}
+	err := r.dialAndHandshake(ctx)
+	if err != nil {
+		r.dropConn()
+		r.retryAt = time.Now().Add(redisRedialBackoff)
+	}
+	return err
+}
+
+func (r *respRedis) dialAndHandshake(ctx context.Context) error {
+	dialCtx, cancel := context.WithTimeout(ctx, redisDialTimeout)
+	defer cancel()
 
 	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", addr)
+	conn, err := d.DialContext(dialCtx, "tcp", r.addr)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if useTLS {
+	if r.useTLS {
 		tconn := tls.Client(conn, &tls.Config{MinVersion: tls.VersionTLS12})
-		if err := tconn.HandshakeContext(ctx); err != nil {
+		if err := tconn.HandshakeContext(dialCtx); err != nil {
 			conn.Close()
-			return nil, err
+			return err
 		}
 		conn = tconn
 	}
+	r.conn = conn
+	r.rd = bufio.NewReader(conn)
+	r.bw = bufio.NewWriter(conn)
 
-	r := &respRedis{
-		conn: conn,
-		rd:   bufio.NewReader(conn),
-		bw:   bufio.NewWriter(conn),
-		log:  log,
-	}
-
-	if pwd != "" {
-		if _, err := r.do(ctx, "AUTH", pwd); err != nil {
-			conn.Close()
-			return nil, err
+	if r.pwd != "" {
+		if _, err := r.roundTrip(dialCtx, "AUTH", r.pwd); err != nil {
+			return err
 		}
 	}
-	if db != 0 {
-		if _, err := r.do(ctx, "SELECT", strconv.Itoa(db)); err != nil {
-			conn.Close()
-			return nil, err
+	if r.db != 0 {
+		if _, err := r.roundTrip(dialCtx, "SELECT", strconv.Itoa(r.db)); err != nil {
+			return err
 		}
 	}
-	if _, err := r.do(ctx, "PING"); err != nil {
-		conn.Close()
-		return nil, err
+	_, err = r.roundTrip(dialCtx, "PING")
+	return err
+}
+
+// dropConn closes the connection so the next command redials. Caller holds r.mu.
+func (r *respRedis) dropConn() {
+	if r.conn != nil {
+		r.conn.Close()
+		r.conn = nil
 	}
-	return r, nil
 }
 
 func parseRedisURL(redisURL, passwordOverride string) (addr string, useTLS bool, pwd string, err error) {
@@ -104,13 +157,33 @@ func parseRedisURL(redisURL, passwordOverride string) (addr string, useTLS bool,
 }
 
 func (r *respRedis) Close() error {
-	return r.conn.Close()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.dropConn()
+	return nil
 }
 
 func (r *respRedis) do(ctx context.Context, args ...string) (interface{}, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if r.conn == nil {
+		if err := r.connect(ctx); err != nil {
+			return nil, err
+		}
+		r.log.warnf("redis reconnected addr=%s", r.addr)
+	}
+	v, err := r.roundTrip(ctx, args...)
+	if err != nil {
+		if _, ok := err.(redisReplyError); !ok {
+			r.dropConn()
+		}
+	}
+	return v, err
+}
+
+// roundTrip sends one command and reads its reply. Caller holds r.mu.
+func (r *respRedis) roundTrip(ctx context.Context, args ...string) (interface{}, error) {
 	deadline := time.Now().Add(5 * time.Second)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
@@ -169,7 +242,7 @@ func readRespReply(rd *bufio.Reader) (interface{}, error) {
 		}
 		body := line[:len(line)-2]
 		if c == '-' {
-			return nil, fmt.Errorf("redis: %s", body)
+			return nil, redisReplyError(body)
 		}
 		if c == ':' {
 			return strconv.ParseInt(string(body), 10, 64)

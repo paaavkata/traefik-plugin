@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"regexp"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -72,6 +73,10 @@ type compiledEndpoint struct {
 
 // SnapshotCache polls service-service for the registry snapshot and caches it.
 type SnapshotCache struct {
+	// loaded flips to true after the first successful refresh. Until then the
+	// cache matches nothing; in enforce mode the plugin fails closed (503)
+	// rather than passing un-gated traffic to backends.
+	loaded          atomic.Bool
 	mu              sync.RWMutex
 	snapshot        *SnapshotDTO
 	compiled        []compiledEndpoint
@@ -244,6 +249,7 @@ func (sc *SnapshotCache) refresh(ctx context.Context) {
 	sc.compiled = compiled
 	sc.version = snap.Version
 	sc.mu.Unlock()
+	sc.loaded.Store(true)
 
 	sc.log.debugf("registry snapshot loaded version=%s apps=%d endpoints=%d duration=%s", snap.Version, len(snap.Apps), len(compiled), dur)
 }
@@ -298,3 +304,8 @@ func (sc *SnapshotCache) matchEndpoint(appID, method, path string) *compiledEndp
 	}
 	return nil
 }
+
+// Loaded reports whether at least one snapshot refresh has succeeded since
+// process start. A later failed refresh keeps the last good snapshot and
+// Loaded stays true.
+func (sc *SnapshotCache) Loaded() bool { return sc.loaded.Load() }

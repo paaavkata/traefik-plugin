@@ -290,7 +290,18 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	// 1. Match the request against the registry snapshot (scoped to the resolved app)
+	// 1. Match the request against the registry snapshot (scoped to the resolved app).
+	// A snapshot that has never loaded (service-service / Redis down while Traefik
+	// restarted) matches nothing; in enforce mode that must be 503, never an
+	// un-gated pass-through to the backends.
+	if p.config.AppResolutionMode == "enforce" && !p.snapshot.Loaded() {
+		p.log.errorf("endpoint snapshot unavailable (cold) host=%q path=%s (enforce)", p.resolutionHost(req), req.URL.Path)
+		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{
+			"error":   "snapshot_unavailable",
+			"message": "registry snapshot is not loaded",
+		})
+		return
+	}
 	ep := p.snapshot.matchEndpoint(appID, req.Method, req.URL.Path)
 	if ep == nil {
 		// Endpoint not registered — pass through (or deny depending on policy).

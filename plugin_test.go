@@ -18,6 +18,7 @@ func setupTestSnapshot() *SnapshotCache {
 	sc := &SnapshotCache{
 		stopCh: make(chan struct{}),
 	}
+	sc.loaded.Store(true) // fixtures stand in for a successful refresh
 	sc.snapshot = &SnapshotDTO{
 		Version: "1",
 		Apps: []SnapshotAppDTO{

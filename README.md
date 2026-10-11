@@ -5,7 +5,8 @@ Traefik middleware plugin for the FileConvert API gateway. Handles JWT authentic
 ## Features
 
 - **JWT validation (dual-issuer)** — legacy HS256 tokens issued by identity-service (shared secret), plus Keycloak RS256 tokens (JWKS, per-`kid` key cache) for apps listed in `keycloakApps`; rejects expired/tampered tokens, fails closed
-- **Admin access control** — endpoints marked `admin` in the registry require admin role (checked via identity-service)
+- **Policy authorization** (`authorizationMode: policy`, `authz.go`/`policy.go`) — the principal's Keycloak roles resolve through the registry snapshot's role bindings to policies; a request passes when a statement grants the endpoint's `required_permission` on the target application. The target application is a validated inbound `X-App-Id` (operator consoles) or the host's app. `X-Is-Admin` is derived from a literal `*` grant. `GET /api/_iam/me` is answered by the plugin. See "Policy authorization" below.
+- **Admin access control (legacy engine)** — `authorizationMode: legacy` (default): endpoints marked `admin` in the registry require an admin role (`keycloakAdminRoles` for Keycloak tokens, identity-service for HS256); the policy verdict is still computed and logged as `shadow=`
 - **Rate limiting** — fixed-window limiter backed by Redis, per-user or per-session, plan-aware limits from service-service snapshot
 - **Registry snapshot** — polls service-service for endpoint metadata (access levels, rate limits per plan)
 - **Plan resolution** — resolves user's plan tier via service-service customer rate-tier endpoint, scoped per `(app_id, user_id)`
@@ -44,7 +45,9 @@ All options are configurable via the Traefik Middleware CRD (see `helm/middlewar
 | `userUidHeader` | `X-User-Uid` | Stamped with the Keycloak `sub` (UUID) on the Keycloak path only; always stripped inbound |
 | `userEmailHeader` | _(empty = inert)_ | When set (e.g. `X-User-Email`): always stripped inbound; stamped only on the Keycloak path from `email` when `email_verified` is `true`. Enabled per env in the Middleware |
 | `keycloakUserIdClaim` | `luid` | Claim stamped into `X-User-Id` (legacy_user_id mapper), falling back to `sub` |
-| `keycloakAdminRoles` | `admin, owner` | Token roles (azp client roles + realm roles) implying `X-Is-Admin: true` |
+| `keycloakAdminRoles` | `admin, owner` | **Legacy engine only.** Token roles (azp client roles + realm roles) implying `X-Is-Admin: true`. Ignored under `authorizationMode: policy` (admin is a `*` grant) |
+| `operatorRealm` | _(none)_ | `{issuer, jwksUrl}` of the platform operators' realm (the console's `infra` realm). Accepted on EVERY application next to the app's own realm; what the token may do is decided by policy. Validator is picked by exact `iss` match |
+| `authorizationMode` | `legacy` | `legacy` = today's engine (host-pinned app, `token.app_id == host app`, admin role list) plus a `shadow=allow|deny` log line with the policy verdict; `policy` = policy engine (requested app via `X-App-Id`, bindings → statements, derived `X-Is-Admin`, `/api/_iam/me`). Rollback is this one key |
 | `keycloakClockSkewSeconds` | `30` | Leeway for exp/nbf/iat validation on the Keycloak path |
 | `jwksRefreshInterval` | `10m` | Background JWKS refresh period |
 | `jwksRefetchCooldown` | `30s` | Min interval between on-demand JWKS refetches triggered by unknown `kid`s |
@@ -66,7 +69,7 @@ All options are configurable via the Traefik Middleware CRD (see `helm/middlewar
 | `defaultRateLimitRequests` | `30` | Fallback rate limit |
 | `defaultRateLimitDurationSeconds` | `60` | Fallback window |
 | `defaultPlanName` | `free` | Plan for anonymous users |
-| `adminAccessLevel` | `admin` | Access level name for admin endpoints |
+| `adminAccessLevel` | `admin` | Legacy engine only: access level name implying `adminPermission`. The policy engine reads only `required_permission` (the registry resolves the fallback) |
 | `httpTimeout` | `5s` | Timeout for upstream HTTP calls |
 | `disableRateLimit` | `false` | Skip rate limiting (debug) |
 | `disableAuth` | `false` | Skip JWT validation (debug) |
@@ -106,6 +109,50 @@ boundary (e.g. near the end of one window and the start of the next) — a known
 trade-off, not a bug. Limits are sourced per-endpoint-per-plan from the service-service
 registry snapshot, falling back to `defaultRateLimitRequests` / `defaultRateLimitDurationSeconds`
 when the endpoint has no plan-specific limit configured.
+
+## Policy authorization (`authorizationMode: policy`)
+
+The registry snapshot carries `policies` (named lists of allow statements
+`{actions, apps}`) and `bindings` (qualified role → policy). Statement grammar:
+
+```
+action  "*" | "<resource>.*" | "<resource>.<action>" | "authenticated"
+app     "*" | "@home" (the application the token was issued for) | <app id>
+role    "<azp client id>:<role>" for client roles, bare for realm roles
+```
+
+Per request:
+
+1. **Target application** = validated inbound `X-App-Id` (must be an active app, else
+   `403 unknown_app`), else the host's application. The header is re-stamped with the
+   authorized value; a route registered for the host app but not exposed to the target is
+   refused (`403`, `reason=endpoint_not_exposed`), never passed through.
+2. **Credential**: HS256 only on non-Keycloak / `acceptLegacy` apps; RS256 validated by
+   the realm whose `iss` the token carries, out of {target app's realm, `operatorRealm`}.
+   Any other issuer → `401` (`reason=issuer_rejected`). No replay guard: scope is policy.
+3. **Principal**: Keycloak subject, user id, `app_id` claim as home application, qualified
+   roles → bound policies → statements. Legacy HS256 principals get a synthetic set from
+   identity-service `/authz` (permissions on `@home`, `is_admin` ⇒ `*` on `@home`).
+   API keys get `authenticated` on their bound application.
+4. **Evaluation**: `required_permission` empty → open; no token → `401 reason=no_token`;
+   no statement grants it on the target → `403 reason=no_matching_statement`.
+   `authenticated` is granted only by `*` or the literal `authenticated`.
+5. **Headers**: `X-App-Id` (target), `X-User-Id`, `X-User-Uid`, `X-User-Email` (if
+   enabled), `X-User-Plan`, `X-User-Roles` (bound roles only), `X-Is-Admin: true` only for
+   a literal `*` grant on the target application.
+6. **Owner gate** on the derived admin header; **rate limit** keyed by the target
+   application, `*` holders exempt there.
+7. `GET /api/_iam/me` → `{subject, user_id, home_app, roles, policies,
+   permissions_by_app}` for any authenticated principal (401 otherwise); never forwarded.
+
+Every 401/403 logs one line with `reason=` (`no_token`, `issuer_rejected`,
+`unknown_app`, `no_matching_statement`, `owner_mismatch`, `endpoint_not_exposed`).
+Under `legacy` the same evaluation is logged as `shadow=allow|deny … unbound_role=[…]`
+without affecting the verdict, so bindings can be verified before flipping the mode.
+
+Cutover order: service-service with the policy API → seed bindings → Traefik image with
+`authorizationMode: legacy` + `operatorRealm` → watch `shadow=` → flip to `policy`.
+Rollback is `authorizationMode: legacy` (config only).
 
 ## Dual-issuer auth (Keycloak)
 
@@ -148,7 +195,11 @@ keycloakJwksUrl: "http://keycloak-service.keycloak.svc:8080/realms/platform/prot
 keycloakIssuer: "https://auth.internal.cloudfusion.tech/realms/platform"   # MUST match token `iss` exactly
 keycloakApps: ["scantinel"]
 keycloakUserIdClaim: "luid"
-keycloakAdminRoles: ["admin", "owner"]
+keycloakAdminRoles: ["admin", "owner"]   # legacy engine only
+operatorRealm:
+  issuer: "https://auth.internal.cloudfusion.tech/realms/infra"
+  jwksUrl: "http://keycloak-service.keycloak.svc:8080/realms/infra/protocol/openid-connect/certs"
+authorizationMode: "legacy"              # flip to "policy" after bindings are seeded
 keycloakClockSkewSeconds: 30
 jwksRefreshInterval: "10m"
 jwksRefetchCooldown: "30s"

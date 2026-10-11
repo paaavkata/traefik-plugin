@@ -20,6 +20,11 @@ type SnapshotDTO struct {
 	Version     string           `json:"version"`
 	GeneratedAt time.Time        `json:"generated_at"`
 	Apps        []SnapshotAppDTO `json:"apps"`
+	// Policies and Bindings are the access-policy registry (authz.go). Absent
+	// on snapshots from a service-service older than gateway-iam-policies, in
+	// which case no role binds to anything (policy mode denies every gated route).
+	Policies []Policy  `json:"policies"`
+	Bindings []Binding `json:"bindings"`
 }
 
 // SnapshotAppDTO groups one app's exposed services. app_id lives here (not on
@@ -80,6 +85,7 @@ type SnapshotCache struct {
 	mu              sync.RWMutex
 	snapshot        *SnapshotDTO
 	compiled        []compiledEndpoint
+	policies        *policyIndex
 	version         string
 	client          *http.Client
 	baseURL         string
@@ -244,14 +250,17 @@ func (sc *SnapshotCache) refresh(ctx context.Context) {
 		}
 	}
 
+	idx := newPolicyIndex(snap.Policies, snap.Bindings)
+
 	sc.mu.Lock()
 	sc.snapshot = &snap
 	sc.compiled = compiled
+	sc.policies = idx
 	sc.version = snap.Version
 	sc.mu.Unlock()
 	sc.loaded.Store(true)
 
-	sc.log.debugf("registry snapshot loaded version=%s apps=%d endpoints=%d duration=%s", snap.Version, len(snap.Apps), len(compiled), dur)
+	sc.log.debugf("registry snapshot loaded version=%s apps=%d endpoints=%d policies=%d bindings=%d duration=%s", snap.Version, len(snap.Apps), len(compiled), len(idx.policies), len(idx.rolePolicy), dur)
 }
 
 func compileRegex(pathRegex, fullPath string) *regexp.Regexp {
@@ -303,6 +312,14 @@ func (sc *SnapshotCache) matchEndpoint(appID, method, path string) *compiledEndp
 		return anyMatch // unresolved app: policy applies regardless of app
 	}
 	return nil
+}
+
+// policyIndex returns the compiled policies/bindings of the last good snapshot
+// (nil before the first load: nothing is bound, evaluation denies).
+func (sc *SnapshotCache) policyIndex() *policyIndex {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+	return sc.policies
 }
 
 // Loaded reports whether at least one snapshot refresh has succeeded since

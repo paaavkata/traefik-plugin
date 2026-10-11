@@ -1,6 +1,7 @@
 package traefik_gateway_plugin
 
 import (
+	"encoding/base64"
 	"net/http/httptest"
 	"testing"
 )
@@ -24,3 +25,5 @@ func TestAnonymousRateLimitKey(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+func b64(s string) string { return base64.RawURLEncoding.EncodeToString([]byte(s)) }

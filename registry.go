@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -54,6 +55,7 @@ type AppRegistryCache struct {
 	mu        sync.RWMutex
 	byHost    map[string]string
 	wildcards []wildcardHostEntry
+	active    map[string]bool // active app ids (apps[] with status active, plus every host-mapped app)
 	version   string
 	loaded    bool // true once at least one snapshot has been successfully loaded
 
@@ -216,14 +218,47 @@ func (c *AppRegistryCache) refresh(ctx context.Context) {
 		byHost[nh] = entry.AppID
 	}
 
+	active := make(map[string]bool)
+	for _, a := range snap.Apps {
+		if strings.EqualFold(a.Status, "active") && a.AppID != "" {
+			active[a.AppID] = true
+		}
+	}
+	for _, id := range byHost {
+		active[id] = true
+	}
+	for _, w := range wildcards {
+		active[w.appID] = true
+	}
+
 	c.mu.Lock()
 	c.byHost = byHost
 	c.wildcards = wildcards
+	c.active = active
 	c.version = snap.Version
 	c.loaded = true
 	c.mu.Unlock()
 
 	c.log.debugf("app registry snapshot loaded version=%s hosts=%d wildcards=%d duration=%s", snap.Version, len(byHost), len(wildcards), dur)
+}
+
+// isActiveApp reports whether appID is a registered active application.
+func (c *AppRegistryCache) isActiveApp(appID string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.active[appID]
+}
+
+// activeAppIDs returns the sorted active application ids.
+func (c *AppRegistryCache) activeAppIDs() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]string, 0, len(c.active))
+	for id := range c.active {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // resolveHost maps a request host to an app_id. It returns (appID, true) only when

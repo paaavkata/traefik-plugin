@@ -39,6 +39,21 @@ type Config struct {
 	// adding an entry is inert until the image carrying it is deployed.
 	KeycloakRealms []KeycloakRealm `json:"keycloakRealms" yaml:"keycloakRealms"`
 
+	// OperatorRealm is the realm of the platform operators (the console's
+	// `infra` realm). Its tokens are accepted on EVERY application (next to the
+	// application's own realm); what they may do there is decided by policy.
+	// AppID is ignored. Empty issuer/jwksUrl = no operator realm.
+	OperatorRealm KeycloakRealm `json:"operatorRealm" yaml:"operatorRealm"`
+
+	// AuthorizationMode selects the authorization engine:
+	//   "legacy" — (DEFAULT) today's path: keycloakAdminRoles / identity authz,
+	//              host-pinned app, token.app_id must equal the host app. The
+	//              policy outcome is still computed and logged as `shadow=`.
+	//   "policy" — gateway-iam-policies: principal roles → snapshot bindings →
+	//              policy statements; requested application via X-App-Id;
+	//              X-Is-Admin derived from a "*" grant; GET /api/_iam/me.
+	AuthorizationMode string `json:"authorizationMode" yaml:"authorizationMode"`
+
 	// KeycloakUserIDClaim is the claim stamped into X-User-Id when present on the
 	// token, falling back to `sub`. Default "luid" — the legacy_user_id protocol
 	// mapper — so migrated users keep their numeric platform user id.
@@ -192,6 +207,7 @@ func CreateConfig() *Config {
 		JWTIssuer:                       "file-convert.online",
 		JWTHeaderKey:                    "Authorization",
 		KeycloakUserIDClaim:             "luid",
+		AuthorizationMode:               "legacy",
 		KeycloakAdminRoles:              []string{"admin", "owner"},
 		KeycloakClockSkewSeconds:        30,
 		JWKSRefreshInterval:             "10m",

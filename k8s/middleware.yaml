@@ -34,6 +34,14 @@ spec:
       keycloakAdminRoles:
         - "admin"
         - "owner"
+      # Operator realm (platform console): accepted on every application next to
+      # the app's own realm; policy decides what an operator token may do there.
+      operatorRealm:
+        issuer: "https://auth.internal.cloudfusion.tech/realms/infra"
+        jwksUrl: "http://keycloak-service.keycloak.svc:8080/realms/infra/protocol/openid-connect/certs"
+      # "legacy" (default) keeps today's engine and logs the policy verdict as
+      # shadow=; "policy" switches to the access-policy registry (README).
+      authorizationMode: "legacy"
       keycloakClockSkewSeconds: 30
       jwksRefreshInterval: "10m"
       jwksRefetchCooldown: "30s"

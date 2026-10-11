@@ -30,6 +30,12 @@ spec:
       # inactive host → 403 (unknown_app); cold registry → 503. No request reaches the
       # backend without a host-resolved X-App-Id. ("permissive"/"disabled" are local/debug only.)
       appResolutionMode: "enforce"
+      # Operator realm (platform console) and the authorization engine; see README
+      # "Policy authorization". "legacy" keeps today's behaviour and logs shadow=.
+      operatorRealm:
+        issuer: "https://auth.internal.cloudfusion.tech/realms/infra"
+        jwksUrl: "http://keycloak-service.keycloak.svc:8080/realms/infra/protocol/openid-connect/certs"
+      authorizationMode: "legacy"
       # Prod path is CloudFlare→nginx→Traefik; unconfirmed whether the original Host
       # survives or arrives as X-Forwarded-Host. Default false (resolve from req.Host).
       trustForwardedHost: false

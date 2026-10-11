@@ -18,7 +18,7 @@ type GatewayPlugin struct {
 
 	snapshot     *SnapshotCache
 	appRegistry  *AppRegistryCache
-	rateLimiter  *RateLimiter
+	rateLimiter  rateLimitChecker
 	identity     *IdentityClient
 	planResolver *PlanResolver
 	apiKeys      *APIKeyVerifier
@@ -27,6 +27,18 @@ type GatewayPlugin struct {
 	// takes the legacy HS256 path exactly as before.
 	keycloakRealms map[string]*keycloakRealmRuntime
 	keycloakLeeway time.Duration
+	// operatorRealm is accepted on every application (policy decides what the
+	// token may do there). nil when not configured.
+	operatorRealm *keycloakRealmRuntime
+	// policyMode is true for authorizationMode "policy" (authz.go evaluator);
+	// false keeps the legacy engine and logs the policy outcome as shadow=.
+	policyMode bool
+}
+
+// rateLimitChecker is what the request path needs from the rate limiter;
+// *RateLimiter satisfies it, tests inject fakes.
+type rateLimitChecker interface {
+	Check(ctx context.Context, key, endpointUID string, limit, windowSeconds int) (*RateLimitResult, error)
 }
 
 // keycloakRealmRuntime is a validated realm binding with its JWKS key source.
@@ -51,10 +63,14 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	plog := newPluginLogger(config.LogLevel)
 
 	plugin := &GatewayPlugin{
-		next:   next,
-		name:   name,
-		config: config,
-		log:    plog,
+		next:       next,
+		name:       name,
+		config:     config,
+		log:        plog,
+		policyMode: strings.EqualFold(config.AuthorizationMode, "policy"),
+	}
+	if m := strings.ToLower(strings.TrimSpace(config.AuthorizationMode)); m != "" && m != "legacy" && m != "policy" {
+		return nil, fmt.Errorf("traefik-gateway-plugin: authorizationMode must be \"legacy\" or \"policy\" (got %q)", config.AuthorizationMode)
 	}
 
 	// Snapshot cache — shared process-wide so that the many routers referencing this
@@ -95,6 +111,15 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 			issuer:       r.Issuer,
 			jwks:         getSharedJWKSCache(r.JWKSURL, httpTimeout, jwksRefresh, jwksCooldown, plog),
 			acceptLegacy: r.AcceptLegacy,
+		}
+	}
+	if op := config.OperatorRealm; op.Issuer != "" || op.JWKSURL != "" {
+		if op.Issuer == "" || op.JWKSURL == "" {
+			return nil, fmt.Errorf("traefik-gateway-plugin: operatorRealm needs both issuer and jwksUrl")
+		}
+		plugin.operatorRealm = &keycloakRealmRuntime{
+			issuer: op.Issuer,
+			jwks:   getSharedJWKSCache(op.JWKSURL, httpTimeout, jwksRefresh, jwksCooldown, plog),
 		}
 	}
 
@@ -222,8 +247,6 @@ func (p *GatewayPlugin) applyCORSHeaders(rw http.ResponseWriter, origin string) 
 }
 
 func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	ctx := req.Context()
-
 	// 0. CORS — must run before everything so that preflight bypasses auth/rate-limiting
 	// and all plugin-generated error responses carry the correct CORS headers.
 	if len(p.config.CORSAllowedOrigins) > 0 {
@@ -241,6 +264,11 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
+
+	// Requested application (policy mode only): the inbound X-App-Id is read
+	// BEFORE the strip, validated against the registry and re-stamped with the
+	// authorized value in servePolicy. It is never trusted as-is.
+	requestedApp := strings.TrimSpace(req.Header.Get(p.config.AppIDHeader))
 
 	// Strip ALL gateway-owned trust headers unconditionally at entry. These are stamped
 	// by THIS plugin only from validated data; any inbound client copy is a spoof and
@@ -290,10 +318,9 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	// 1. Match the request against the registry snapshot (scoped to the resolved app).
-	// A snapshot that has never loaded (service-service / Redis down while Traefik
-	// restarted) matches nothing; in enforce mode that must be 503, never an
-	// un-gated pass-through to the backends.
+	// Snapshot cold check: a snapshot that has never loaded (service-service /
+	// Redis down while Traefik restarted) matches nothing; in enforce mode that
+	// must be 503, never an un-gated pass-through to the backends.
 	if p.config.AppResolutionMode == "enforce" && !p.snapshot.Loaded() {
 		p.log.errorf("endpoint snapshot unavailable (cold) host=%q path=%s (enforce)", p.resolutionHost(req), req.URL.Path)
 		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{
@@ -302,6 +329,27 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		})
 		return
 	}
+
+	// Identity introspection is served by the gateway itself (both modes).
+	if req.URL.Path == iamMePath {
+		p.serveIAMMe(rw, req, appID)
+		return
+	}
+
+	if p.policyMode {
+		p.servePolicy(rw, req, appID, requestedApp)
+		return
+	}
+	p.serveLegacy(rw, req, appID)
+}
+
+// serveLegacy is the pre-policy authorization engine (authorizationMode
+// "legacy"): keycloakAdminRoles / identity-service authz, host-pinned app,
+// token.app_id must equal the host app. It additionally computes the policy
+// outcome and logs it as shadow= so bindings can be verified before cutover.
+func (p *GatewayPlugin) serveLegacy(rw http.ResponseWriter, req *http.Request, appID string) {
+	ctx := req.Context()
+
 	ep := p.snapshot.matchEndpoint(appID, req.Method, req.URL.Path)
 	if ep == nil {
 		// Endpoint not registered — pass through (or deny depending on policy).
@@ -340,7 +388,7 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			claims, err = parseJWT(authHeader, p.config.JWTSecret, p.config.JWTIssuer)
 		}
 		if err != nil {
-			p.log.errorf("jwt auth failure path=%s error=%v", req.URL.Path, err)
+			p.log.errorf("jwt auth failure path=%s reason=issuer_rejected error=%v", req.URL.Path, err)
 			writeJSON(rw, http.StatusUnauthorized, map[string]string{
 				"error":   "unauthorized",
 				"message": err.Error(),
@@ -353,7 +401,7 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			// sides are known — legacy tokens without the claim (claims.AppID == "")
 			// and unresolved hosts (appID == "", permissive/disabled) pass through.
 			if claims.AppID != "" && appID != "" && claims.AppID != appID {
-				p.log.warnf("jwt app mismatch path=%s user_id=%s token_app_id=%s host_app_id=%s", req.URL.Path, claims.UserID, claims.AppID, appID)
+				p.log.warnf("jwt app mismatch path=%s reason=issuer_rejected user_id=%s token_app_id=%s host_app_id=%s", req.URL.Path, claims.UserID, claims.AppID, appID)
 				writeJSON(rw, http.StatusUnauthorized, map[string]string{
 					"error":   "unauthorized",
 					"message": "token was not issued for this application",
@@ -365,6 +413,7 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				expStr = claims.ExpiresAt.Format(time.RFC3339)
 			}
 			p.log.infof("jwt auth success path=%s user_id=%s issuer=%s exp=%s", req.URL.Path, claims.UserID, claims.Issuer, expStr)
+			p.logShadow(ctx, ep, appID, appID, claims)
 		} else {
 			p.log.debugf("jwt anonymous path=%s (no bearer credentials)", req.URL.Path)
 		}
@@ -385,7 +434,7 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	authzStamped := false
 	if requiredPermission != "" {
 		if claims == nil {
-			p.log.warnf("permission-gated endpoint requires auth path=%s permission=%s", req.URL.Path, requiredPermission)
+			p.log.warnf("permission-gated endpoint requires auth path=%s reason=no_token app_id=%s permission=%s", req.URL.Path, appID, requiredPermission)
 			writeJSON(rw, http.StatusUnauthorized, map[string]string{
 				"error":   "unauthorized",
 				"message": "authentication required for this endpoint",
@@ -406,7 +455,7 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 		if err != nil || !authz.Has(requiredPermission) {
 			if err == nil {
-				p.log.warnf("permission denied user_id=%s path=%s required=%s roles=%v", claims.UserID, req.URL.Path, requiredPermission, authz.Roles)
+				p.log.warnf("permission denied reason=no_matching_statement user_id=%s path=%s app_id=%s required=%s roles=%v", claims.UserID, req.URL.Path, appID, requiredPermission, authz.Roles)
 			}
 			writeJSON(rw, http.StatusForbidden, map[string]string{
 				"error":   "forbidden",
@@ -478,7 +527,7 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			return
 		}
 		if req.Header.Get(p.config.IsAdminHeader) != "true" && !ownerMatches(extractOwner(ep, req), claims.UserID, claims.Subject) {
-			p.log.warnf("owner gate denied user_id=%s path=%s owner_param=%s", claims.UserID, req.URL.Path, ep.OwnerParam)
+			p.log.warnf("owner gate denied reason=owner_mismatch user_id=%s path=%s app_id=%s owner_param=%s", claims.UserID, req.URL.Path, appID, ep.OwnerParam)
 			writeJSON(rw, http.StatusForbidden, map[string]string{
 				"error":   "forbidden",
 				"message": "not allowed to access another user's resource",
@@ -573,19 +622,25 @@ func (p *GatewayPlugin) serveAPIKey(rw http.ResponseWriter, req *http.Request, e
 		return
 	}
 
-	// Permission gate: API-key auth has no permissions in v1, so any permission-gated
-	// endpoint denies key auth (deny, not fall-through to anonymous).
+	// Permission gate. Legacy engine: API-key auth has no permissions, so any
+	// permission-gated endpoint denies key auth (deny, not fall-through to
+	// anonymous). Policy engine: a key is a tenant user of its bound application
+	// (statement `authenticated` on @home), so it passes `authenticated` routes
+	// of its own app and nothing tagged narrower.
 	requiredPermission := ep.RequiredPermission
-	if requiredPermission == "" && ep.AccessLevel == p.config.AdminAccessLevel {
+	if !p.policyMode && requiredPermission == "" && ep.AccessLevel == p.config.AdminAccessLevel {
 		requiredPermission = p.config.AdminPermission
 	}
 	if requiredPermission != "" {
-		p.log.warnf("api-key denied on permission-gated endpoint path=%s uid=%s required=%s", req.URL.Path, key.uid, requiredPermission)
-		writeJSON(rw, http.StatusForbidden, map[string]string{
-			"error":   "forbidden",
-			"message": "api key authentication is not permitted for this endpoint",
-		})
-		return
+		keyPrincipal := &principal{userID: res.UserID, homeApp: res.AppID, statements: apiKeyStatements()}
+		if !p.policyMode || !keyPrincipal.granted(requiredPermission, appID) {
+			p.log.warnf("api-key denied on permission-gated endpoint reason=no_matching_statement path=%s app_id=%s uid=%s required=%s", req.URL.Path, appID, key.uid, requiredPermission)
+			writeJSON(rw, http.StatusForbidden, map[string]string{
+				"error":   "forbidden",
+				"message": "api key authentication is not permitted for this endpoint",
+			})
+			return
+		}
 	}
 
 	// Owner gate: keys never carry admin, so no bypass — own id only.

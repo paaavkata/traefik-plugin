@@ -26,8 +26,11 @@ type TokenClaims struct {
 	Keycloak bool
 	IsAdmin  bool
 	Roles    []string
-	Subject  string // Keycloak `sub` (UUID) → X-User-Uid
-	Email    string // Keycloak `email`, only when `email_verified` is true
+	// QualifiedRoles are the binding names of the token's roles: client roles of
+	// the authorized party as "<azp>:<role>", realm roles bare (authz.go).
+	QualifiedRoles []string
+	Subject        string // Keycloak `sub` (UUID) → X-User-Uid
+	Email          string // Keycloak `email`, only when `email_verified` is true
 }
 
 // parseJWT extracts and validates a JWT from the Authorization header value.
@@ -179,6 +182,8 @@ func parseKeycloakJWT(authHeader string, keys rsaKeyProvider, expectedIssuer, us
 	}
 
 	roles := keycloakRoles(claims)
+	clientRoles, realmRoles := keycloakRoleSets(claims)
+	azp, _ := claims["azp"].(string)
 	isAdmin := false
 	for _, r := range roles {
 		for _, a := range adminRoles {
@@ -194,16 +199,46 @@ func parseKeycloakJWT(authHeader string, keys rsaKeyProvider, expectedIssuer, us
 	}
 
 	return &TokenClaims{
-		UserID:    userID,
-		Issuer:    iss,
-		AppID:     tokenAppID,
-		ExpiresAt: expAt,
-		Keycloak:  true,
-		IsAdmin:   isAdmin,
-		Roles:     roles,
-		Subject:   sub,
-		Email:     email,
+		UserID:         userID,
+		Issuer:         iss,
+		AppID:          tokenAppID,
+		ExpiresAt:      expAt,
+		Keycloak:       true,
+		IsAdmin:        isAdmin,
+		Roles:          roles,
+		QualifiedRoles: qualifyRoles(azp, clientRoles, realmRoles),
+		Subject:        sub,
+		Email:          email,
 	}, nil
+}
+
+// keycloakRoleSets returns the azp client's roles and the realm roles separately.
+func keycloakRoleSets(claims jwt.MapClaims) (clientRoles, realmRoles []string) {
+	collect := func(v interface{}) []string {
+		out := []string{}
+		arr, ok := v.([]interface{})
+		if !ok {
+			return out
+		}
+		for _, item := range arr {
+			if s, ok := item.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	clientRoles, realmRoles = []string{}, []string{}
+	if azp, _ := claims["azp"].(string); azp != "" {
+		if ra, ok := claims["resource_access"].(map[string]interface{}); ok {
+			if client, ok := ra[azp].(map[string]interface{}); ok {
+				clientRoles = collect(client["roles"])
+			}
+		}
+	}
+	if realm, ok := claims["realm_access"].(map[string]interface{}); ok {
+		realmRoles = collect(realm["roles"])
+	}
+	return clientRoles, realmRoles
 }
 
 // keycloakRoles collects the app-scoped client roles of the authorized party

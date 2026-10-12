@@ -138,7 +138,7 @@ func (p *GatewayPlugin) servePolicy(rw http.ResponseWriter, req *http.Request, h
 			p.deny(rw, req, http.StatusForbidden, "forbidden", "endpoint is not exposed to the requested application", reasonEndpointNotExposed, target, "", "")
 			return
 		}
-		p.next.ServeHTTP(rw, req)
+		p.forward(rw, req)
 		return
 	}
 
@@ -226,7 +226,7 @@ func (p *GatewayPlugin) servePolicy(rw http.ResponseWriter, req *http.Request, h
 		return
 	}
 
-	p.next.ServeHTTP(rw, req)
+	p.forward(rw, req)
 }
 
 // applyRateLimit runs the fixed-window check; false when the request was

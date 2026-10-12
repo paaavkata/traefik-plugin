@@ -2,6 +2,8 @@ package traefik_gateway_plugin
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -246,7 +248,37 @@ func (p *GatewayPlugin) applyCORSHeaders(rw http.ResponseWriter, origin string) 
 	return false
 }
 
+const requestIDHeader = "X-Request-ID"
+
+// ensureRequestID echoes the client's X-Request-ID or generates one, stamps it
+// on the request (forwarded to backends) and the response, and returns it.
+func ensureRequestID(rw http.ResponseWriter, req *http.Request) string {
+	rid := strings.TrimSpace(req.Header.Get(requestIDHeader))
+	if rid == "" {
+		b := make([]byte, 16)
+		if _, err := rand.Read(b); err != nil {
+			rid = strconv.FormatInt(time.Now().UnixNano(), 16)
+		} else {
+			rid = hex.EncodeToString(b)
+		}
+		req.Header.Set(requestIDHeader, rid)
+	}
+	rw.Header().Set(requestIDHeader, rid)
+	return rid
+}
+
+// forward is the single exit to the next handler: it writes the access log
+// line with the request id so gateway and backend logs share one id.
+func (p *GatewayPlugin) forward(rw http.ResponseWriter, req *http.Request) {
+	p.log.infof("access request_id=%s method=%s path=%s app_id=%s user_id=%s",
+		req.Header.Get(requestIDHeader), req.Method, req.URL.Path,
+		req.Header.Get(p.config.AppIDHeader), req.Header.Get(p.config.UserIDHeader))
+	p.next.ServeHTTP(rw, req)
+}
+
 func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	ensureRequestID(rw, req)
+
 	// 0. CORS — must run before everything so that preflight bypasses auth/rate-limiting
 	// and all plugin-generated error responses carry the correct CORS headers.
 	if len(p.config.CORSAllowedOrigins) > 0 {
@@ -354,11 +386,11 @@ func (p *GatewayPlugin) serveLegacy(rw http.ResponseWriter, req *http.Request, a
 	if ep == nil {
 		// Endpoint not registered — pass through (or deny depending on policy).
 		// Default: pass through to let Traefik's own routing handle 404.
-		p.next.ServeHTTP(rw, req)
+		p.forward(rw, req)
 		return
 	}
 
-	p.log.debugf("incoming request method=%s path=%s remote=%q headers=[%s]", req.Method, req.URL.Path, req.RemoteAddr, formatRequestHeaders(req))
+	p.log.debugf("incoming request request_id=%s method=%s path=%s remote=%q headers=[%s]", req.Header.Get(requestIDHeader), req.Method, req.URL.Path, req.RemoteAddr, formatRequestHeaders(req))
 
 	// 1b. API-key credential path (contract §4). If the client presents an fc_ key
 	// (X-Api-Key or Authorization: Bearer fc_...), take the API-key path INSTEAD of
@@ -565,7 +597,7 @@ func (p *GatewayPlugin) serveLegacy(rw http.ResponseWriter, req *http.Request, a
 	}
 
 	// 6. Forward to next handler
-	p.next.ServeHTTP(rw, req)
+	p.forward(rw, req)
 }
 
 // serveAPIKey handles the API-key credential path (contract §4). It parses the fc_
@@ -701,7 +733,7 @@ func (p *GatewayPlugin) serveAPIKey(rw http.ResponseWriter, req *http.Request, e
 	}
 
 	// Forward to next handler.
-	p.next.ServeHTTP(rw, req)
+	p.forward(rw, req)
 }
 
 // resolutionHost returns the host used for app resolution. The prod path is

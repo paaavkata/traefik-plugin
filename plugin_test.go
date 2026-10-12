@@ -337,6 +337,41 @@ func TestPlugin_ExpiredJWT(t *testing.T) {
 	}
 }
 
+func TestPlugin_RequestID_GeneratedAndPreserved(t *testing.T) {
+	config := CreateConfig()
+	config.JWTSecret = "test-secret"
+	config.DisableRateLimit = true
+
+	var seen string
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		seen = req.Header.Get("X-Request-ID")
+		rw.WriteHeader(http.StatusOK)
+	})
+	plugin := &GatewayPlugin{next: next, name: "test", config: config, snapshot: setupTestSnapshot()}
+
+	// Absent: generated, forwarded to the backend and returned to the client.
+	rr := httptest.NewRecorder()
+	plugin.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/unknown/path", nil))
+	if seen == "" {
+		t.Fatal("expected a generated X-Request-ID on the forwarded request")
+	}
+	if got := rr.Header().Get("X-Request-ID"); got != seen {
+		t.Fatalf("response X-Request-ID %q != forwarded %q", got, seen)
+	}
+
+	// Present: preserved as-is.
+	req := httptest.NewRequest(http.MethodGet, "/unknown/path", nil)
+	req.Header.Set("X-Request-ID", "abc")
+	rr = httptest.NewRecorder()
+	plugin.ServeHTTP(rr, req)
+	if seen != "abc" {
+		t.Fatalf("forwarded X-Request-ID = %q, want abc", seen)
+	}
+	if got := rr.Header().Get("X-Request-ID"); got != "abc" {
+		t.Fatalf("response X-Request-ID = %q, want abc", got)
+	}
+}
+
 func TestPlugin_UnregisteredEndpoint_PassThrough(t *testing.T) {
 	config := CreateConfig()
 	config.JWTSecret = "test-secret"

@@ -133,7 +133,18 @@ func parseKeycloakJWT(authHeader string, keys rsaKeyProvider, expectedIssuer, us
 		if kid == "" {
 			return nil, fmt.Errorf("token missing kid header")
 		}
-		return keys.keyForKid(kid)
+		// Unpack explicitly: `return keys.keyForKid(kid)` through the
+		// (interface{}, error) keyfunc loses the error under yaegi and hands
+		// golang-jwt a nil *rsa.PublicKey, which panics inside rsa.VerifyPKCS1v15
+		// (Traefik recovers it as a 500 instead of this 401).
+		key, err := keys.keyForKid(kid)
+		if err != nil {
+			return nil, err
+		}
+		if key == nil {
+			return nil, fmt.Errorf("no JWKS key for kid %q", kid)
+		}
+		return key, nil
 	}, jwt.WithValidMethods([]string{"RS256"}), jwt.WithLeeway(leeway))
 
 	if err != nil {

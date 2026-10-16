@@ -107,12 +107,24 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	plugin.keycloakRealms = make(map[string]*keycloakRealmRuntime, len(kcRealms))
 	jwksRefresh := parseDuration(config.JWKSRefreshInterval, 10*time.Minute)
 	jwksCooldown := parseDuration(config.JWKSRefetchCooldown, 30*time.Second)
-	for app, r := range kcRealms {
-		// One shared cache per JWKS URL (apps on the same realm share it).
-		plugin.keycloakRealms[app] = &keycloakRealmRuntime{
-			issuer:       r.Issuer,
-			jwks:         getSharedJWKSCache(r.JWKSURL, httpTimeout, jwksRefresh, jwksCooldown, plog),
-			acceptLegacy: r.AcceptLegacy,
+	// One shared cache per JWKS URL (apps on the same realm share it).
+	//
+	// Deliberately NOT `for app, r := range kcRealms { ...{jwks: getSharedJWKSCache(r.JWKSURL)} }`:
+	// under yaegi (Traefik's plugin interpreter) that shape bound EVERY app to the
+	// cache of one realm, so ~10% of middleware instances verified fileconvert
+	// tokens against the scantinel JWKS (2026-10-16 prod 500s). Index the map
+	// per key and hold the cache in a local before building the struct.
+	for app := range kcRealms {
+		r := kcRealms[app]
+		jc := getSharedJWKSCache(r.JWKSURL, httpTimeout, jwksRefresh, jwksCooldown, plog)
+		plugin.keycloakRealms[app] = &keycloakRealmRuntime{issuer: r.Issuer, jwks: jc, acceptLegacy: r.AcceptLegacy}
+	}
+	// Fail the middleware build if any realm is bound to the wrong JWKS cache,
+	// so an interpreter regression surfaces at reload time instead of as 500s.
+	for app := range kcRealms {
+		want := kcRealms[app].JWKSURL
+		if jc, ok := plugin.keycloakRealms[app].jwks.(*JWKSCache); !ok || jc.url != want {
+			return nil, fmt.Errorf("traefik-gateway-plugin: realm for app %q bound to the wrong JWKS cache (want %s)", app, want)
 		}
 	}
 	if op := config.OperatorRealm; op.Issuer != "" || op.JWKSURL != "" {

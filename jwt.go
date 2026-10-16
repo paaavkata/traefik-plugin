@@ -44,6 +44,11 @@ func parseJWT(authHeader, secret, expectedIssuer string) (*TokenClaims, error) {
 	if tokenStr == authHeader {
 		return nil, fmt.Errorf("malformed authorization header")
 	}
+	// No jwtSecret configured = the HS256 path is off. Without this, HMAC with
+	// an empty key would accept any token signed with the empty string.
+	if secret == "" {
+		return nil, fmt.Errorf("legacy HS256 tokens are not accepted (no jwtSecret configured)")
+	}
 
 	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
@@ -337,8 +342,9 @@ func deriveUserID(sub string) uint64 {
 }
 
 // tokenAlg returns the unverified `alg` of a bearer token's JOSE header ("" when
-// unparseable). Used ONLY to pick a validator on acceptLegacy realms; each
-// validator still pins its own algorithm, so a lying header just fails there.
+// unparseable). Used ONLY to pick a validator (policy engine, and the
+// deprecated acceptLegacy realms); each validator still pins its own
+// algorithm, so a lying header just fails there.
 func tokenAlg(authHeader string) string {
 	tok := strings.TrimPrefix(authHeader, "Bearer ")
 	i := strings.IndexByte(tok, '.')

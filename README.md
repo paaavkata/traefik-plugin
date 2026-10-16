@@ -4,7 +4,7 @@ Traefik middleware plugin for the FileConvert API gateway. Handles JWT authentic
 
 ## Features
 
-- **JWT validation (dual-issuer)** — legacy HS256 tokens issued by identity-service (shared secret), plus Keycloak RS256 tokens (JWKS, per-`kid` key cache) for apps listed in `keycloakApps`; rejects expired/tampered tokens, fails closed
+- **JWT validation (dual-issuer)** — Keycloak RS256 tokens (JWKS, per-`kid` key cache) for apps listed in `keycloakApps` / `keycloakRealms` (today: every app — `scantinel`, `fileconvert`), legacy HS256 identity-service tokens (shared secret) only for apps with no realm; rejects expired/tampered tokens, fails closed
 - **Policy authorization** (`authorizationMode: policy`, `authz.go`/`policy.go`) — the principal's Keycloak roles resolve through the registry snapshot's role bindings to policies; a request passes when a statement grants the endpoint's `required_permission` on the target application. The target application is a validated inbound `X-App-Id` (operator consoles) or the host's app. `X-Is-Admin` is derived from a literal `*` grant. `GET /api/_iam/me` is answered by the plugin. See "Policy authorization" below.
 - **Admin access control (legacy engine)** — `authorizationMode: legacy` (default): endpoints marked `admin` in the registry require an admin role (`keycloakAdminRoles` for Keycloak tokens, identity-service for HS256); the policy verdict is still computed and logged as `shadow=`
 - **Rate limiting** — fixed-window limiter backed by Redis, per-user or per-session, plan-aware limits from service-service snapshot
@@ -36,12 +36,12 @@ All options are configurable via the Traefik Middleware CRD (see `helm/middlewar
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `jwtSecret` | — | HMAC secret for JWT verification (legacy HS256 path — all apps not in `keycloakApps`) |
+| `jwtSecret` | — | HMAC secret for JWT verification (legacy HS256 path — only apps with no Keycloak realm; empty = HS256 tokens rejected) |
 | `jwtIssuer` | `file-convert.online` | Expected JWT issuer (HS256 path) |
 | `keycloakApps` | `[]` | app_ids validated on the Keycloak RS256/JWKS path (e.g. `[scantinel]`). Empty = Keycloak path disabled entirely |
 | `keycloakJwksUrl` | — | Realm JWKS endpoint (or OIDC discovery URL; `jwks_uri` is followed). Required when `keycloakApps` is set |
 | `keycloakIssuer` | — | Expected `iss`, byte-for-byte (realm public URL). Required when `keycloakApps` is set |
-| `keycloakRealms` | `[]` | Per-app realms: list of `{appId, issuer, jwksUrl, acceptLegacy}`. Makes `appId` a Keycloak app validated against ITS realm (overrides the scalar realm for that app). `acceptLegacy: true` also accepts legacy HS256 identity-service tokens for that app (dispatch by token `alg`; each validator still pins its algorithm) — the migration window. Older plugin builds ignore this key |
+| `keycloakRealms` | `[]` | Per-app realms: list of `{appId, issuer, jwksUrl}`. Makes `appId` a Keycloak app validated against ITS realm (overrides the scalar realm for that app); an HS256 token on such an app is a 401. `acceptLegacy: true` (DEPRECATED, removed next release) additionally accepted legacy HS256 identity-service tokens for that app during the migration window; logged as a warning at startup |
 | `userUidHeader` | `X-User-Uid` | Stamped with the Keycloak `sub` (UUID) on the Keycloak path only; always stripped inbound |
 | `userEmailHeader` | _(empty = inert)_ | When set (e.g. `X-User-Email`): always stripped inbound; stamped only on the Keycloak path from `email` when `email_verified` is `true`. Enabled per env in the Middleware |
 | `keycloakUserIdClaim` | `luid` | Claim stamped into `X-User-Id` (legacy_user_id mapper), falling back to `sub` |
@@ -127,7 +127,7 @@ Per request:
    `403 unknown_app`), else the host's application. The header is re-stamped with the
    authorized value; a route registered for the host app but not exposed to the target is
    refused (`403`, `reason=endpoint_not_exposed`), never passed through.
-2. **Credential**: HS256 only on non-Keycloak / `acceptLegacy` apps; RS256 validated by
+2. **Credential**: HS256 only on apps with no Keycloak realm; RS256 validated by
    the realm whose `iss` the token carries, out of {target app's realm, `operatorRealm`}.
    Any other issuer → `401` (`reason=issuer_rejected`). No replay guard: scope is policy.
 3. **Principal**: Keycloak subject, user id, `app_id` claim as home application, qualified
@@ -165,8 +165,10 @@ resolution:
   `keycloakIssuer` exactly, exp/nbf/iat checked with `keycloakClockSkewSeconds` leeway.
   The `app_id` claim (hardcoded per-client protocol mapper) is REQUIRED and the existing
   cross-app replay check (`token.app_id == host app_id`) runs unchanged.
-- every other app (fileconvert, …) → the **HS256 shared-secret** path, byte-for-byte
-  unchanged.
+- `app_id` bound by `keycloakRealms` (e.g. `fileconvert`) → the same RS256 + JWKS validation
+  against that app's own realm.
+- an app with no realm at all (none in dev/prod today) → the **HS256 shared-secret** path
+  (`jwtSecret`, `jwtIssuer`); with `jwtSecret` empty, HS256 tokens are rejected.
 
 Each path pins its algorithm (`WithValidMethods`), so an HS256 token can never validate on
 the Keycloak path or vice versa (alg-confusion guard in both directions).

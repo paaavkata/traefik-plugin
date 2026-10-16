@@ -118,6 +118,9 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		r := kcRealms[app]
 		jc := getSharedJWKSCache(r.JWKSURL, httpTimeout, jwksRefresh, jwksCooldown, plog)
 		plugin.keycloakRealms[app] = &keycloakRealmRuntime{issuer: r.Issuer, jwks: jc, acceptLegacy: r.AcceptLegacy}
+		if r.AcceptLegacy {
+			plog.warnf("keycloakRealms[%s].acceptLegacy is deprecated and will be removed: HS256 identity-service tokens are still accepted for this app", app)
+		}
 	}
 	// Fail the middleware build if any realm is bound to the wrong JWKS cache,
 	// so an interpreter regression surfaces at reload time instead of as 500s.
@@ -416,9 +419,9 @@ func (p *GatewayPlugin) serveLegacy(rw http.ResponseWriter, req *http.Request, a
 
 	// 2. Parse JWT (if present). Dual-issuer dispatch by the host-resolved app_id:
 	// Keycloak apps → RS256 + JWKS + that app's realm issuer; everything else → the
-	// legacy HS256 shared-secret path, byte-for-byte unchanged. A realm with
-	// acceptLegacy also routes HS256-headed tokens to the legacy validator
-	// (migration window); the header only picks the validator, never the verdict. Because each path pins its
+	// legacy HS256 shared-secret path, byte-for-byte unchanged. A realm with the
+	// deprecated acceptLegacy also routes HS256-headed tokens to the legacy
+	// validator; the header only picks the validator, never the verdict. Because each path pins its
 	// algorithm (WithValidMethods), a token from one issuer can never validate on
 	// the other's path (alg-confusion guard in both directions).
 	var claims *TokenClaims

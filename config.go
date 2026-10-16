@@ -194,10 +194,12 @@ type KeycloakRealm struct {
 	AppID   string `json:"appId" yaml:"appId"`
 	Issuer  string `json:"issuer" yaml:"issuer"`   // exact expected `iss`
 	JWKSURL string `json:"jwksUrl" yaml:"jwksUrl"` // JWKS or OIDC discovery URL
-	// AcceptLegacy also accepts legacy HS256 identity-service tokens for this app
-	// (validated on the unchanged jwtSecret path) — the migration window where
-	// old sessions and Keycloak sessions coexist. Dispatch is by the token's
-	// `alg` header: HS256 -> legacy validator, anything else -> this realm.
+	// AcceptLegacy: DEPRECATED, removed in the next release. It also accepted
+	// legacy HS256 identity-service tokens for this app (jwtSecret path) during
+	// the identity-service -> Keycloak migration window. fileconvert dev and
+	// prod are Keycloak-only since 2026-10-15; the Middlewares no longer set it.
+	// Default false: an HS256 token on a Keycloak app is a 401. Setting it
+	// still works for one release (logged as a warning at startup).
 	AcceptLegacy bool `json:"acceptLegacy" yaml:"acceptLegacy"`
 }
 

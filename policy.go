@@ -17,7 +17,7 @@ import (
 //  2. endpoint match under the target app
 //  3. credential: API key, or bearer token validated by the realm whose `iss`
 //     it carries, out of {target app's realm, operator realm}; HS256 only on
-//     acceptLegacy / non-Keycloak apps
+//     non-Keycloak apps (and realms still setting the deprecated acceptLegacy)
 //  4. principal → bound roles → policy statements (authz.go)
 //  5. required permission: no token → 401 no_token; no statement → 403
 //  6. trusted headers stamped (X-Is-Admin only for a literal "*" grant)

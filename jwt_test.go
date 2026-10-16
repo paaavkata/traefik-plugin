@@ -121,3 +121,12 @@ func TestParseJWT_AppIDClaim_AbsentIsEmpty(t *testing.T) {
 		t.Errorf("expected empty AppID for legacy token, got %q", claims.AppID)
 	}
 }
+
+// An empty jwtSecret disables the HS256 path instead of verifying with an
+// empty HMAC key (which would accept tokens signed with "").
+func TestParseJWT_EmptySecretRejects(t *testing.T) {
+	token := createTestToken("", 42, "file-convert.online", time.Now().Add(time.Hour))
+	if _, err := parseJWT("Bearer "+token, "", "file-convert.online"); err == nil {
+		t.Fatal("expected error for empty secret")
+	}
+}

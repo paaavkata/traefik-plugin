@@ -341,26 +341,6 @@ func TestPolicy_RateLimitKeyedByTargetAndWildcardExempt(t *testing.T) {
 
 // --- legacy adapter --------------------------------------------------------
 
-// --- API keys ----------------------------------------------------------------
-
-func TestPolicy_APIKeyIsTenantUserOfItsApp(t *testing.T) {
-	h := newPolicyHarness(t, "policy")
-	srv, _ := mockIdentityVerify(t, http.StatusOK, map[string]interface{}{"user_id": "77", "app_id": "fileconvert", "plan": "pro", "scopes": []string{}})
-	defer srv.Close()
-	h.p.apiKeys = newAPIKeyVerifier(srv.URL+"/internal/v1/api-keys/verify", 2*time.Second, nil, "gw:rl:", nil)
-	key := validKey("abcdef123456", "supersecretvalue")
-
-	if rr := h.do(http.MethodGet, "http://fileconvert.online/api/cms/v1/profile", "", map[string]string{"X-Api-Key": key}); rr.Code != http.StatusOK || h.got.Get("X-User-Id") != "77" || h.got.Get("X-Is-Admin") != "" {
-		t.Fatalf("key on authenticated route: %d id=%q admin=%q", rr.Code, h.got.Get("X-User-Id"), h.got.Get("X-Is-Admin"))
-	}
-	if rr := h.do(http.MethodPost, "http://fileconvert.online/api/cms/v1/content/x/publish", "", map[string]string{"X-Api-Key": key}); rr.Code != http.StatusForbidden {
-		t.Fatalf("key on content.publish: expected 403, got %d", rr.Code)
-	}
-	if rr := h.do(http.MethodGet, "http://scantinel.ai/api/cms/v1/profile", "", map[string]string{"X-Api-Key": key}); rr.Code != http.StatusUnauthorized {
-		t.Fatalf("key on another app: expected 401, got %d", rr.Code)
-	}
-}
-
 // --- introspection ----------------------------------------------------------
 
 func TestIAMMe(t *testing.T) {

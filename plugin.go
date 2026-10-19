@@ -22,7 +22,6 @@ type GatewayPlugin struct {
 	appRegistry  *AppRegistryCache
 	rateLimiter  rateLimitChecker
 	planResolver *PlanResolver
-	apiKeys      *APIKeyVerifier
 
 	// Keycloak state: app_id -> its realm. An app without a realm rejects every
 	// bearer token.
@@ -134,23 +133,6 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 
 	// Plan resolver
 	plugin.planResolver = newPlanResolver(config.ServiceServiceURL, httpTimeout, plog)
-
-	// API-key verifier (contract §4). Uses a dedicated Redis connection for its
-	// positive/negative verify cache so it works independently of rate-limiting.
-	// While Redis is unreachable the cache read/write fails and every key request
-	// hits identity-service directly; the client reconnects once Redis is back.
-	var apiKeyCache *respRedis
-	if config.RedisURL != "" {
-		dialCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		c, err := dialRedis(dialCtx, config.RedisURL, config.RedisPassword, config.RedisDB, plog)
-		cancel()
-		if err != nil {
-			plog.warnf("api-key cache redis config invalid (cache disabled, verifying every request): %v", err)
-		} else {
-			apiKeyCache = c
-		}
-	}
-	plugin.apiKeys = newAPIKeyVerifier(config.IdentityVerifyURL, httpTimeout, apiKeyCache, config.RedisPrefix, plog)
 
 	return plugin, nil
 }
@@ -320,7 +302,7 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	req.Header.Del(p.config.UserPlanHeader)
 	req.Header.Del(p.config.IsAdminHeader)
 	req.Header.Del(p.config.UserRolesHeader)
-	req.Header.Del(p.config.ApiKeyUidHeader)
+	req.Header.Del(legacyAPIKeyUIDHeader)
 	req.Header.Del(p.config.UserUIDHeader)
 	if p.config.UserEmailHeader != "" {
 		req.Header.Del(p.config.UserEmailHeader)
@@ -398,13 +380,10 @@ func (p *GatewayPlugin) serveLegacy(rw http.ResponseWriter, req *http.Request, a
 
 	p.log.debugf("incoming request request_id=%s method=%s path=%s remote=%q headers=[%s]", req.Header.Get(requestIDHeader), req.Method, req.URL.Path, req.RemoteAddr, formatRequestHeaders(req))
 
-	// 1b. API-key credential path (contract §4). If the client presents an fc_ key
-	// (X-Api-Key or Authorization: Bearer fc_...), take the API-key path INSTEAD of
-	// JWT parsing. On success this stamps X-User-Id / X-User-Plan / X-Api-Key-Uid and
-	// jumps straight to rate limiting (skipping JWT, cross-app JWT replay, and RBAC —
-	// API keys never carry admin and are denied on permission-gated endpoints in v1).
-	if rawKey, isKey := extractAPIKeyCredential(req, p.config.JWTHeaderKey); isKey && !p.config.DisableAuth {
-		p.serveAPIKey(rw, req, ep, appID, rawKey)
+	// 1b. Retired fc_ API keys are not a credential: reject them explicitly so
+	// an old client config never falls through to the anonymous path.
+	if !p.config.DisableAuth && hasLegacyAPIKey(req, p.config.JWTHeaderKey) {
+		p.rejectLegacyAPIKey(rw, req)
 		return
 	}
 
@@ -570,146 +549,34 @@ func (p *GatewayPlugin) serveLegacy(rw http.ResponseWriter, req *http.Request, a
 	p.forward(rw, req)
 }
 
-// serveAPIKey handles the API-key credential path (contract §4). It parses the fc_
-// token, verifies it (cache→identity), enforces app binding, denies permission-gated
-// endpoints, stamps the trusted headers, buckets rate limiting by key_uid, and
-// forwards. All error responses mirror the plugin's existing JSON error style.
-//
-// Precondition: the trust-header strip at ServeHTTP entry has already removed any
-// inbound X-User-Id / X-User-Plan / X-Is-Admin / X-User-Roles / X-Api-Key-Uid copy,
-// so a spoofed inbound value can never survive here.
-func (p *GatewayPlugin) serveAPIKey(rw http.ResponseWriter, req *http.Request, ep *compiledEndpoint, appID, rawKey string) {
-	ctx := req.Context()
+// legacyAPIKeyPrefix / legacyAPIKeyUIDHeader belong to the retired fc_ API-key
+// path (verification lived in identity-service). Keys are no longer a credential;
+// the header is still stripped unconditionally so a client can never spoof it.
+const (
+	legacyAPIKeyPrefix    = "fc_"
+	legacyAPIKeyUIDHeader = "X-Api-Key-Uid"
+)
 
-	// Parse fc_<env>_<uid>_<secret>; malformed → 401.
-	key, err := parseAPIKey(rawKey)
-	if err != nil {
-		p.log.warnf("api-key malformed path=%s error=%v", req.URL.Path, err)
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{
-			"error":   "unauthorized",
-			"message": "malformed api key",
-		})
-		return
+// hasLegacyAPIKey reports whether the request presents a retired fc_ key, in
+// X-Api-Key or as the bearer value.
+func hasLegacyAPIKey(req *http.Request, jwtHeaderKey string) bool {
+	if strings.HasPrefix(strings.TrimSpace(req.Header.Get("X-Api-Key")), legacyAPIKeyPrefix) {
+		return true
 	}
-
-	// Verify (cache first, then identity-service). Identity unreachable → 503
-	// fail-closed for key traffic only.
-	res, outcome := p.apiKeys.Verify(ctx, key)
-	switch outcome {
-	case apiKeyUnavailable:
-		p.log.errorf("api-key verify unavailable path=%s uid=%s (fail-closed 503)", req.URL.Path, key.uid)
-		writeJSON(rw, http.StatusServiceUnavailable, map[string]string{
-			"error":   "identity_unavailable",
-			"message": "key verification is temporarily unavailable",
-		})
-		return
-	case apiKeyDenied:
-		p.log.warnf("api-key denied path=%s uid=%s", req.URL.Path, key.uid)
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{
-			"error":   "unauthorized",
-			"message": "invalid api key",
-		})
-		return
-	}
-
-	// App binding: verify response app_id must equal the host-resolved app_id
-	// (mirror of the JWT cross-app check at plugin.go:274). Enforced only when both
-	// sides are known — an unresolved host (appID == "") passes, matching the JWT path.
-	if res.AppID != "" && appID != "" && res.AppID != appID {
-		p.log.warnf("api-key app mismatch path=%s uid=%s key_app_id=%s host_app_id=%s", req.URL.Path, key.uid, res.AppID, appID)
-		writeJSON(rw, http.StatusUnauthorized, map[string]string{
-			"error":   "unauthorized",
-			"message": "key was not issued for this application",
-		})
-		return
-	}
-
-	// Permission gate. Legacy engine: API-key auth has no permissions, so any
-	// permission-gated endpoint denies key auth (deny, not fall-through to
-	// anonymous). Policy engine: a key is a tenant user of its bound application
-	// (statement `authenticated` on @home), so it passes `authenticated` routes
-	// of its own app and nothing tagged narrower.
-	requiredPermission := ep.RequiredPermission
-	if !p.policyMode && requiredPermission == "" && ep.AccessLevel == p.config.AdminAccessLevel {
-		requiredPermission = p.config.AdminPermission
-	}
-	if requiredPermission != "" {
-		keyPrincipal := &principal{userID: res.UserID, homeApp: res.AppID, statements: apiKeyStatements()}
-		if !p.policyMode || !keyPrincipal.granted(requiredPermission, appID) {
-			p.log.warnf("api-key denied on permission-gated endpoint reason=no_matching_statement path=%s app_id=%s uid=%s required=%s", req.URL.Path, appID, key.uid, requiredPermission)
-			writeJSON(rw, http.StatusForbidden, map[string]string{
-				"error":   "forbidden",
-				"message": "api key authentication is not permitted for this endpoint",
-			})
-			return
-		}
-	}
-
-	// Owner gate: keys never carry admin, so no bypass — own id only.
-	if ep.OwnerParam != "" && !ownerMatches(extractOwner(ep, req), res.UserID, "") {
-		p.log.warnf("api-key owner gate denied path=%s uid=%s owner_param=%s", req.URL.Path, key.uid, ep.OwnerParam)
-		writeJSON(rw, http.StatusForbidden, map[string]string{
-			"error":   "forbidden",
-			"message": "not allowed to access another user's resource",
-		})
-		return
-	}
-
-	// Stamp trusted headers. NEVER X-Is-Admin / X-User-Roles on this path.
-	req.Header.Set(p.config.UserIDHeader, res.UserID)
-	if res.Plan != "" {
-		req.Header.Set(p.config.UserPlanHeader, res.Plan)
-	}
-	req.Header.Set(p.config.ApiKeyUidHeader, key.uid)
-	// Remove any client-supplied session header so backends trust X-User-Id alone
-	// (mirrors the authenticated JWT path).
-	req.Header.Del(p.config.SessionIDHeader)
-
-	p.log.infof("api-key auth success path=%s uid=%s user_id=%s plan=%s", req.URL.Path, key.uid, res.UserID, res.Plan)
-
-	// Rate limiting: bucket by key_uid (not session/IP); resolved plan flows into
-	// resolveRateLimit unchanged. Empty plan → DefaultPlanName (contract §3/§4).
-	planName := res.Plan
-	if planName == "" {
-		planName = p.config.DefaultPlanName
-	}
-	rateLimitKey := "app:" + appID + "|key:" + key.uid
-
-	if !p.config.DisableRateLimit && p.rateLimiter != nil {
-		limit, window := p.resolveRateLimit(ep, planName)
-		if limit > 0 {
-			result, err := p.rateLimiter.Check(ctx, rateLimitKey, ep.UID, limit, window)
-			if err != nil {
-				p.log.errorf("rate limit check failed endpoint_uid=%s plan=%s error=%v", ep.UID, planName, err)
-			}
-			if err == nil && !result.Allowed {
-				p.log.warnf("rate limit exceeded endpoint_uid=%s plan=%s key=%s limit=%d window=%ds", ep.UID, planName, rateLimitKey, limit, window)
-				rw.Header().Set("X-RateLimit-Limit", strconv.Itoa(result.Limit))
-				rw.Header().Set("X-RateLimit-Remaining", "0")
-				rw.Header().Set("X-RateLimit-Reset", strconv.FormatInt(result.ResetAt.Unix(), 10))
-				rw.Header().Set("Retry-After", strconv.Itoa(int(time.Until(result.ResetAt).Seconds())))
-				writeJSON(rw, http.StatusTooManyRequests, map[string]string{
-					"error":   "rate_limit_exceeded",
-					"message": "too many requests",
-				})
-				return
-			}
-			if err == nil {
-				rw.Header().Set("X-RateLimit-Limit", strconv.Itoa(result.Limit))
-				rw.Header().Set("X-RateLimit-Remaining", strconv.Itoa(result.Remaining))
-				rw.Header().Set("X-RateLimit-Reset", strconv.FormatInt(result.ResetAt.Unix(), 10))
-			}
-		}
-	}
-
-	// Forward to next handler.
-	p.forward(rw, req)
+	bearer := strings.TrimSpace(strings.TrimPrefix(req.Header.Get(jwtHeaderKey), "Bearer "))
+	return strings.HasPrefix(bearer, legacyAPIKeyPrefix)
 }
 
-// resolutionHost returns the host used for app resolution. The prod path is
-// CloudFlare→nginx→Traefik; whether the original Host survives or arrives as
-// X-Forwarded-Host is unconfirmed, so the source is a config toggle defaulting to the
-// safe req.Host. When TrustForwardedHost is set, X-Forwarded-Host wins if present.
+// rejectLegacyAPIKey answers a retired fc_ key with 401 (reason issuer_rejected,
+// like any other non-realm credential) and a message that names the replacement.
+func (p *GatewayPlugin) rejectLegacyAPIKey(rw http.ResponseWriter, req *http.Request) {
+	p.log.warnf("legacy api key rejected path=%s reason=issuer_rejected", req.URL.Path)
+	writeJSON(rw, http.StatusUnauthorized, map[string]string{
+		"error":   "unauthorized",
+		"message": "api keys are no longer accepted; authenticate with an access token from the application's login (OAuth 2.1)",
+	})
+}
+
 func (p *GatewayPlugin) resolutionHost(req *http.Request) string {
 	if p.config.TrustForwardedHost {
 		if h := req.Header.Get("X-Forwarded-Host"); h != "" {

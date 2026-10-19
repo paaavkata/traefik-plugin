@@ -11,7 +11,7 @@ Traefik middleware plugin for the FileConvert API gateway. Handles JWT authentic
 - **Registry snapshot** — polls service-service for endpoint metadata (access levels, rate limits per plan)
 - **Plan resolution** — resolves user's plan tier via service-service customer rate-tier endpoint, scoped per `(app_id, user_id)`
 - **App resolution (multi-app)** — derives a trusted `X-App-Id` from the request host via application-service's registry snapshot, strips any inbound client copy, and rejects unknown/inactive hosts (default `enforce` mode — see below). Plan/admin/rate-limit/endpoint lookups are app-scoped.
-- **Downstream headers** — forwards `X-User-Id`, `X-User-Plan`, `X-Is-Admin`, `X-User-Roles`, `X-App-Id`, `X-Api-Key-Uid` to backend services, plus `X-User-Uid` (Keycloak `sub`, Keycloak path only). All seven are the configurable-name fields on `Config` (defaults set in `CreateConfig()`, `config.go`) and are **unconditionally stripped from the inbound request at `ServeHTTP` entry** (`plugin.go`, before any auth/routing logic runs) so a client-supplied copy can never survive — the plugin only ever re-stamps from data it validated itself. `X-Is-Admin` / `X-User-Roles` are stamped on **every JWT-authenticated request** (public endpoints included), so a backend can offer admin-only behaviour on a public route; on public endpoints the identity lookup fails soft (headers absent, request still forwarded, failure negatively cached for 10s). **The API-key auth path never sets `X-Is-Admin` / `X-User-Roles`** — see "API-key authentication" below.
+- **Downstream headers** — forwards `X-User-Id`, `X-User-Plan`, `X-Is-Admin`, `X-User-Roles`, `X-App-Id` to backend services, plus `X-User-Uid` (Keycloak `sub`) and `X-User-Email`. All are configurable-name fields on `Config` (defaults set in `CreateConfig()`, `config.go`) and, together with the retired `X-Api-Key-Uid`, are **unconditionally stripped from the inbound request at `ServeHTTP` entry** (`plugin.go`, before any auth/routing logic runs) so a client-supplied copy can never survive — the plugin only ever re-stamps from data it validated itself. `X-Is-Admin` / `X-User-Roles` are stamped on **every JWT-authenticated request** (public endpoints included), so a backend can offer admin-only behaviour on a public route; on public endpoints the identity lookup fails soft (headers absent, request still forwarded, failure negatively cached for 10s). **Retired `fc_` API keys** (`X-Api-Key` or `Authorization: Bearer fc_...`) are rejected with 401 on every registered endpoint, never treated as anonymous.
 - **Unregistered endpoints pass through untouched** — if the request doesn't match any endpoint in the service-service registry snapshot (scoped to the resolved app), the plugin does **zero** enforcement (no auth check, no rate limiting, no header stamping) and forwards straight to the next handler, leaving 404 handling to Traefik's own routing. This is open-by-default for any path the registry doesn't know about — only registered endpoints get gateway enforcement.
 
 ## Request Flow
@@ -21,8 +21,8 @@ Client → Nginx LB (TLS) → Traefik + Plugin → Backend Service
                                  │
         ┌──────────────┬─────────┼──────────────┬──────────────┐
         │              │         │              │              │
- application-service  service-service   identity-service     Redis
- (host→app_id)       (snapshot/plan)   (API-key verify)   (rate limits)
+ application-service  service-service   Keycloak (JWKS)      Redis
+ (host→app_id)       (snapshot/plan)   (token signatures)   (rate limits)
 ```
 
 The plugin resolves `app_id` from the request host first (Step 1a): it unconditionally
@@ -60,8 +60,6 @@ All options are configurable via the Traefik Middleware CRD (see `helm/middlewar
 | `appIdHeader` | `X-App-Id` | Trusted, gateway-stamped app id header (inbound copies stripped) |
 | `appResolutionMode` | `enforce` | `enforce` (**default**; unknown/inactive host → 403, cold registry → 503 — there are NO endpoints allowed without a resolved app_id), `permissive` (pass through, no stamp — local/debug only, do not use in production), or `disabled` (skip resolution — local single-app dev only) |
 | `trustForwardedHost` | `false` | When true resolve from `X-Forwarded-Host`; otherwise from `req.Host` |
-| `identityVerifyUrl` | `http://identity-service:8080/internal/v1/api-keys/verify` | Internal API-key verify endpoint (contract §4). Not registry-registered; full in-cluster path. Verify call is capped at ≤2s; identity unreachable → 503 for key traffic only |
-| `apiKeyUidHeader` | `X-Api-Key-Uid` | Trusted, gateway-stamped API-key uid header (inbound copies stripped on every path) |
 | `usageServiceUrl` | `http://usage-service:8080` | Usage service URL |
 | `defaultRateLimitRequests` | `30` | Fallback rate limit |
 | `defaultRateLimitDurationSeconds` | `60` | Fallback window |
@@ -76,26 +74,14 @@ All options are configurable via the Traefik Middleware CRD (see `helm/middlewar
 | `corsAllowCredentials` | `true` | Sets `Access-Control-Allow-Credentials` |
 | `corsMaxAge` | `3600` | Preflight cache TTL in seconds |
 
-## API-key authentication (`apikey.go`)
+## Retired API keys
 
-Requests may authenticate with a static API key instead of a JWT. Format:
-`fc_<env>_<uid>_<secret>` (a fixed 4-part, underscore-delimited credential). The key is read
-from the `X-Api-Key` header, or from `Authorization: Bearer` when its value starts with the
-`fc_` prefix (`X-Api-Key` takes precedence). When a key is present, the plugin takes this path
-**instead of** JWT parsing — it jumps straight to rate limiting, skipping JWT parsing,
-cross-app JWT replay checks, and RBAC.
-
-Verification is Redis cache-first (positive results cached 60s, negative 10s; only the key's
-hash is cached, never the raw secret), falling back to a `POST` to identity-service's internal
-`/internal/v1/api-keys/verify` endpoint with a hard ≤2s timeout. Any transport error **fails
-closed** (503) — it is never treated as open/anonymous.
-
-On success the plugin stamps `X-User-Id` and `X-Api-Key-Uid` (and `X-User-Plan` when the
-verify response includes one) and rate-limits by key uid. **It never sets `X-Is-Admin` or
-`X-User-Roles`** (explicit in-code comment at the stamping site: "Stamp trusted headers. NEVER
-X-Is-Admin / X-User-Roles on this path.") — API keys carry no admin capability, and
-permission-gated (RBAC) endpoints unconditionally deny API-key auth regardless of the key's
-owner.
+The `fc_<env>_<uid>_<secret>` API-key credential and its identity-service verify
+round-trip were removed 2026-10 (OpenSpec change `drop-identity-service`). A request
+that still presents one, in `X-Api-Key` or as the bearer value, is answered `401`
+(`reason=issuer_rejected`) with a message pointing at OAuth login; it never falls through
+to the anonymous path. `X-Api-Key-Uid` is still stripped from every inbound request. Agents
+authenticate with realm access tokens obtained through the MCP OAuth flow (mcp-service).
 
 ## Rate limiting (`ratelimit.go`)
 
@@ -239,8 +225,8 @@ go test ./...
 
 ## Identity Service Requirement
 
-Only the internal API-key verify endpoint (`identityVerifyUrl`, contract §4). The
-admin-status / authz lookups used by the removed HS256 path are no longer called.
+None. The plugin makes no request to identity-service: tokens validate against the realm
+JWKS, authorization comes from token roles, and API keys no longer exist.
 
 ### X-User-Id for Keycloak principals
 

@@ -116,13 +116,6 @@ func TestPermissionsByApp(t *testing.T) {
 	}
 }
 
-func TestAPIKeyAdapter(t *testing.T) {
-	key := &principal{homeApp: "fileconvert", statements: apiKeyStatements()}
-	if !key.granted("authenticated", "fileconvert") || key.granted("authenticated", "scantinel") || key.granted("content.read", "fileconvert") || key.isWildcard("fileconvert") {
-		t.Fatal("api key: authenticated on its own app only")
-	}
-}
-
 func TestQualifyRolesAndTokenIssuer(t *testing.T) {
 	got := qualifyRoles("platform-admin", []string{"admin", "admin"}, []string{"default-roles-infra", ""})
 	if !reflect.DeepEqual(got, []string{"platform-admin:admin", "default-roles-infra"}) {

@@ -116,9 +116,9 @@ func (p *GatewayPlugin) servePolicy(rw http.ResponseWriter, req *http.Request, h
 		return
 	}
 
-	// 3. Credential.
-	if rawKey, isKey := extractAPIKeyCredential(req, p.config.JWTHeaderKey); isKey && !p.config.DisableAuth {
-		p.serveAPIKey(rw, req, ep, target, rawKey)
+	// 3. Credential. Retired fc_ API keys are rejected outright.
+	if !p.config.DisableAuth && hasLegacyAPIKey(req, p.config.JWTHeaderKey) {
+		p.rejectLegacyAPIKey(rw, req)
 		return
 	}
 	claims, reason, err := p.authenticate(target, req.Header.Get(p.config.JWTHeaderKey))

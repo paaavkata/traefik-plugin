@@ -116,31 +116,6 @@ func TestPlugin_OwnerGate_Tokens(t *testing.T) {
 	}
 }
 
-// API keys: own id only, never an admin bypass.
-func TestPlugin_OwnerGate_APIKey(t *testing.T) {
-	srv, _ := mockIdentityVerify(t, http.StatusOK, map[string]interface{}{
-		"user_id": "77", "app_id": "fileconvert", "plan": "free", "scopes": []string{},
-	})
-	defer srv.Close()
-	for url, want := range map[string]int{
-		"/api/conversion/v1/user/77":          200,
-		"/api/conversion/v1/user/78":          403,
-		"/api/conversion/v1/owned?user_id=77": 200,
-		"/api/conversion/v1/owned?user_id=78": 403,
-		"/api/conversion/v1/admin/user/77":    403, // admin-gated: keys denied
-	} {
-		p := newAPIKeyPlugin(t, http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) { rw.WriteHeader(http.StatusOK) }), srv.URL+"/internal/v1/api-keys/verify", nil)
-		req := httptest.NewRequest(http.MethodGet, url, nil)
-		req.Host = "fileconvert.online"
-		req.Header.Set("X-Api-Key", validKey("ownerkey1234", "sekret"))
-		rr := httptest.NewRecorder()
-		p.ServeHTTP(rr, req)
-		if rr.Code != want {
-			t.Errorf("%s: got %d want %d", url, rr.Code, want)
-		}
-	}
-}
-
 // Keycloak path: own luid (X-User-Id) or own sub (X-User-Uid) pass; other ids
 // 403 unless the token carries an admin realm role.
 func TestPlugin_OwnerGate_Keycloak(t *testing.T) {

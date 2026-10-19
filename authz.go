@@ -187,11 +187,6 @@ func (p *principal) resolveStatements(idx *policyIndex) {
 	}
 }
 
-// apiKeyStatements: an API key is a tenant user of its bound application.
-func apiKeyStatements() []Statement {
-	return []Statement{{Actions: []string{permAuthenticated}, Apps: []string{appHome}}}
-}
-
 // policyIndex is the compiled form of the snapshot's policies and bindings.
 type policyIndex struct {
 	policies   map[string][]Statement // policy name → statements

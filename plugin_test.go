@@ -1341,3 +1341,42 @@ func TestPlugin_PermissionEndpoint_AnonymousUnauthorized(t *testing.T) {
 		t.Errorf("expected 401 for anonymous on permission-gated endpoint, got %d", rr.Code)
 	}
 }
+
+// Retired fc_ API keys are not a credential: 401 on every endpoint (public
+// ones included, never anonymous fall-through), in X-Api-Key or as the bearer,
+// and the gateway-stamped X-Api-Key-Uid header can never be spoofed in.
+func TestPlugin_LegacyAPIKey_Rejected(t *testing.T) {
+	config := CreateConfig()
+	config.DisableRateLimit = true
+	var gotUID string
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		gotUID = req.Header.Get("X-Api-Key-Uid")
+		rw.WriteHeader(http.StatusOK)
+	})
+	plugin := &GatewayPlugin{next: next, name: "test", config: config, snapshot: setupTestSnapshot(), log: newPluginLogger("error")}
+
+	for _, tc := range []struct{ name, path, hdr, val string }{
+		{"bearer on authenticated endpoint", "/api/conversion/v1/comments/hide", "Authorization", "Bearer fc_live_abc_def"},
+		{"x-api-key on authenticated endpoint", "/api/conversion/v1/comments/hide", "X-Api-Key", "fc_live_abc_def"},
+		{"bearer on free endpoint", "/api/conversion/v1/convert", "Authorization", "Bearer fc_live_abc_def"},
+		{"x-api-key on free endpoint", "/api/conversion/v1/convert", "X-Api-Key", "fc_live_abc_def"},
+	} {
+		req := httptest.NewRequest(http.MethodPost, tc.path, nil)
+		req.Header.Set(tc.hdr, tc.val)
+		req.Header.Set("X-Api-Key-Uid", "spoofed")
+		rr := httptest.NewRecorder()
+		plugin.ServeHTTP(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("%s: got %d want 401 body=%s", tc.name, rr.Code, rr.Body.String())
+		}
+	}
+
+	// A plain anonymous request still passes, with the inbound uid header stripped.
+	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+	req.Header.Set("X-Api-Key-Uid", "spoofed")
+	rr := httptest.NewRecorder()
+	plugin.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || gotUID != "" {
+		t.Errorf("anonymous: code=%d uid=%q", rr.Code, gotUID)
+	}
+}

@@ -128,18 +128,6 @@ type Config struct {
 	// original Host survives, so this is a flag defaulting to the safe req.Host.
 	TrustForwardedHost bool `json:"trustForwardedHost" yaml:"trustForwardedHost"`
 
-	// IdentityVerifyURL is the in-cluster endpoint the gateway POSTs API-key
-	// verification requests to (contract §4). It is NOT registered in the service
-	// registry (internal service-to-service call), so it carries the full path.
-	// Default: identity-service's /internal/v1/api-keys/verify. (identityServiceUrl,
-	// the old authz/admin-status base URL, is no longer read.)
-	IdentityVerifyURL string `json:"identityVerifyUrl" yaml:"identityVerifyUrl"`
-
-	// ApiKeyUidHeader is the trusted, gateway-stamped header carrying the resolved
-	// API key uid on the API-key auth path. Canonical spelling "X-Api-Key-Uid". Any
-	// inbound client copy is stripped unconditionally (mirrors AppIDHeader).
-	ApiKeyUidHeader string `json:"apiKeyUidHeader" yaml:"apiKeyUidHeader"`
-
 	// Usage-service
 	UsageServiceURL string `json:"usageServiceUrl" yaml:"usageServiceUrl"`
 
@@ -214,8 +202,6 @@ func CreateConfig() *Config {
 		AppSnapshotVersionPollInterval:  "5s",
 		AppIDHeader:                     "X-App-Id",
 		AppResolutionMode:               "enforce",
-		IdentityVerifyURL:               "http://identity-service:8080/internal/v1/api-keys/verify",
-		ApiKeyUidHeader:                 "X-Api-Key-Uid",
 		UsageServiceURL:                 "http://usage-service:8080",
 		CORSAllowedMethods:              []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		CORSAllowedHeaders:              []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Session-Id", "X-Device-Id", "X-App-Id"},

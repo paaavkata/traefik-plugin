@@ -16,8 +16,7 @@ import (
 //  1. target application: validated inbound X-App-Id, else the host's app
 //  2. endpoint match under the target app
 //  3. credential: API key, or bearer token validated by the realm whose `iss`
-//     it carries, out of {target app's realm, operator realm}; HS256 only on
-//     non-Keycloak apps (and realms still setting the deprecated acceptLegacy)
+//     it carries, out of {target app's realm, operator realm}
 //  4. principal → bound roles → policy statements (authz.go)
 //  5. required permission: no token → 401 no_token; no statement → 403
 //  6. trusted headers stamped (X-Is-Admin only for a literal "*" grant)
@@ -50,16 +49,6 @@ func (p *GatewayPlugin) authenticate(app, authHeader string) (*TokenClaims, stri
 		return nil, "", nil
 	}
 	realm := p.keycloakRealmFor(app)
-	if tokenAlg(authHeader) == "HS256" {
-		if realm != nil && !realm.acceptLegacy {
-			return nil, reasonIssuerRejected, errLegacyNotAccepted
-		}
-		claims, err := parseJWT(authHeader, p.config.JWTSecret, p.config.JWTIssuer)
-		if err != nil {
-			return nil, reasonIssuerRejected, err
-		}
-		return claims, "", nil
-	}
 	iss := tokenIssuer(authHeader)
 	var chosen *keycloakRealmRuntime
 	if realm != nil && realm.issuer == iss {
@@ -82,33 +71,18 @@ type authError string
 func (e authError) Error() string { return string(e) }
 
 const (
-	errLegacyNotAccepted authError = "legacy tokens are not accepted for this application"
 	errIssuerNotAccepted authError = "token issuer is not accepted for this application"
 )
 
-// principalFor builds the evaluator's view of a validated token. Keycloak
-// principals resolve through the snapshot bindings; legacy HS256 principals
-// through the identity-service adapter (legacyStatements), home = token
-// app_id when present, else the host application.
-func (p *GatewayPlugin) principalFor(ctx context.Context, claims *TokenClaims, hostApp string) *principal {
+// principalFor builds the evaluator's view of a validated token: its roles
+// resolve through the snapshot bindings; home = token app_id when present.
+func (p *GatewayPlugin) principalFor(claims *TokenClaims) *principal {
 	if claims == nil {
 		return nil
 	}
 	pr := &principal{userID: claims.UserID, homeApp: claims.AppID, subject: claims.Subject, email: claims.Email}
-	if claims.Keycloak {
-		pr.roles = claims.QualifiedRoles
-		pr.resolveStatements(p.snapshot.policyIndex())
-		return pr
-	}
-	if pr.homeApp == "" {
-		pr.homeApp = hostApp
-	}
-	authz := p.identity.AuthzSoft(ctx, pr.homeApp, claims.UserID)
-	if authz != nil {
-		pr.roles = authz.Roles
-		pr.boundRoles = authz.Roles
-	}
-	pr.statements = legacyStatements(authz)
+	pr.roles = claims.QualifiedRoles
+	pr.resolveStatements(p.snapshot.policyIndex())
 	return pr
 }
 
@@ -155,7 +129,7 @@ func (p *GatewayPlugin) servePolicy(rw http.ResponseWriter, req *http.Request, h
 	}
 
 	// 4. Principal and statements.
-	pr := p.principalFor(ctx, claims, hostApp)
+	pr := p.principalFor(claims)
 	userID := ""
 	if claims != nil {
 		userID = claims.UserID
@@ -276,7 +250,7 @@ func (p *GatewayPlugin) serveIAMMe(rw http.ResponseWriter, req *http.Request, ho
 		p.deny(rw, req, http.StatusUnauthorized, "unauthorized", "authentication required", reasonNoToken, hostApp, "", "")
 		return
 	}
-	pr := p.principalFor(req.Context(), claims, hostApp)
+	pr := p.principalFor(claims)
 	var active []string
 	if p.appRegistry != nil {
 		active = p.appRegistry.activeAppIDs()
@@ -307,7 +281,7 @@ func (p *GatewayPlugin) logShadow(ctx context.Context, ep *compiledEndpoint, hos
 	if claims == nil || !p.log.enabled(levelInfo) {
 		return
 	}
-	pr := p.principalFor(ctx, claims, hostApp)
+	pr := p.principalFor(claims)
 	perm := ep.RequiredPermission
 	if perm == "" && ep.AccessLevel == p.config.AdminAccessLevel {
 		perm = p.config.AdminPermission

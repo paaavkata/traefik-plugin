@@ -35,10 +35,7 @@ func TestNew_RealmsBoundToOwnJWKS(t *testing.T) {
 	defer dummy.Close()
 
 	cfg := CreateConfig()
-	cfg.JWTSecret = "x"
-	cfg.JWTIssuer = "file-convert.online"
 	cfg.ServiceServiceURL = dummy.URL
-	cfg.IdentityServiceURL = dummy.URL
 	cfg.AppResolutionMode = "disabled"
 	cfg.DisableRateLimit = true
 	cfg.LogLevel = "error"
@@ -47,7 +44,7 @@ func TestNew_RealmsBoundToOwnJWKS(t *testing.T) {
 	cfg.KeycloakJWKSURL = dummy.URL + "/scantinel-jwks"
 	cfg.KeycloakRealms = []KeycloakRealm{{
 		AppID: "fileconvert", Issuer: "https://auth.file-convert.online/realms/fileconvert",
-		JWKSURL: dummy.URL + "/fileconvert-jwks", AcceptLegacy: true,
+		JWKSURL: dummy.URL + "/fileconvert-jwks",
 	}}
 
 	for i := 0; i < 20; i++ {

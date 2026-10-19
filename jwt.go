@@ -1,8 +1,6 @@
 package traefik_gateway_plugin
 
 import (
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -21,8 +19,8 @@ type TokenClaims struct {
 	AppID     string
 	ExpiresAt time.Time
 
-	// Keycloak-only fields — populated by parseKeycloakJWT, zero for legacy HS256
-	// tokens (whose admin/roles resolution stays on the identity-service HTTP path).
+	// Keycloak is always true for claims produced by parseKeycloakJWT (the only
+	// validator left); kept for the header-stamping contract.
 	Keycloak bool
 	IsAdmin  bool
 	Roles    []string
@@ -33,84 +31,13 @@ type TokenClaims struct {
 	Email          string // Keycloak `email`, only when `email_verified` is true
 }
 
-// parseJWT extracts and validates a JWT from the Authorization header value.
-// Returns nil claims (no error) if the header is empty (anonymous request).
-func parseJWT(authHeader, secret, expectedIssuer string) (*TokenClaims, error) {
-	if authHeader == "" {
-		return nil, nil
-	}
-
-	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
-	if tokenStr == authHeader {
-		return nil, fmt.Errorf("malformed authorization header")
-	}
-	// No jwtSecret configured = the HS256 path is off. Without this, HMAC with
-	// an empty key would accept any token signed with the empty string.
-	if secret == "" {
-		return nil, fmt.Errorf("legacy HS256 tokens are not accepted (no jwtSecret configured)")
-	}
-
-	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-		}
-		return []byte(secret), nil
-	}, jwt.WithValidMethods([]string{"HS256"}))
-
-	if err != nil {
-		return nil, fmt.Errorf("invalid token: %w", err)
-	}
-
-	if !token.Valid {
-		return nil, fmt.Errorf("token is not valid")
-	}
-
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		return nil, fmt.Errorf("cannot parse claims")
-	}
-
-	iss, _ := claims.GetIssuer()
-	if expectedIssuer != "" && iss != expectedIssuer {
-		return nil, fmt.Errorf("issuer mismatch: got %q, want %q", iss, expectedIssuer)
-	}
-
-	sub, _ := claims.GetSubject()
-	if sub == "" {
-		return nil, fmt.Errorf("token missing subject")
-	}
-
-	exp, _ := claims.GetExpirationTime()
-	if exp != nil && exp.Time.Before(time.Now()) {
-		return nil, fmt.Errorf("token expired")
-	}
-
-	expAt := time.Time{}
-	if exp != nil {
-		expAt = exp.Time
-	}
-
-	// Optional per-app claim (guide §8.5). identity-service mints it on every
-	// access/refresh token; empty for legacy tokens issued before the claim existed.
-	tokenAppID, _ := claims["app_id"].(string)
-
-	return &TokenClaims{
-		UserID:    sub,
-		Issuer:    iss,
-		AppID:     tokenAppID,
-		ExpiresAt: expAt,
-	}, nil
-}
-
 // parseKeycloakJWT extracts and validates a Keycloak RS256 access token from the
 // Authorization header value. Returns nil claims (no error) if the header is empty
 // (anonymous request). All validation failures return an error — the caller fails
 // closed with 401.
 //
 // Guarantees:
-//   - RS256 only (jwt.WithValidMethods) — an HS256 token can never pass here, and a
-//     Keycloak-issued token can never pass the legacy HS256 path (alg-confusion guard
-//     in both directions; dispatch is by app_id, validation by algorithm).
+//   - RS256 only (jwt.WithValidMethods) — an HS256 token can never pass here.
 //   - `iss` must equal expectedIssuer byte-for-byte.
 //   - signature key selected by `kid` via the JWKS cache (rotation-aware).
 //   - exp/nbf/iat validated with `leeway` clock skew.
@@ -339,27 +266,4 @@ func deriveUserID(sub string) uint64 {
 		h = 1
 	}
 	return h
-}
-
-// tokenAlg returns the unverified `alg` of a bearer token's JOSE header ("" when
-// unparseable). Used ONLY to pick a validator (policy engine, and the
-// deprecated acceptLegacy realms); each validator still pins its own
-// algorithm, so a lying header just fails there.
-func tokenAlg(authHeader string) string {
-	tok := strings.TrimPrefix(authHeader, "Bearer ")
-	i := strings.IndexByte(tok, '.')
-	if i <= 0 {
-		return ""
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(tok[:i])
-	if err != nil {
-		return ""
-	}
-	var h struct {
-		Alg string `json:"alg"`
-	}
-	if json.Unmarshal(raw, &h) != nil {
-		return ""
-	}
-	return h.Alg
 }

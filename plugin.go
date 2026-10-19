@@ -21,12 +21,11 @@ type GatewayPlugin struct {
 	snapshot     *SnapshotCache
 	appRegistry  *AppRegistryCache
 	rateLimiter  rateLimitChecker
-	identity     *IdentityClient
 	planResolver *PlanResolver
 	apiKeys      *APIKeyVerifier
 
-	// Dual-issuer (Keycloak) state: app_id -> its realm. Empty ⇒ every request
-	// takes the legacy HS256 path exactly as before.
+	// Keycloak state: app_id -> its realm. An app without a realm rejects every
+	// bearer token.
 	keycloakRealms map[string]*keycloakRealmRuntime
 	keycloakLeeway time.Duration
 	// operatorRealm is accepted on every application (policy decides what the
@@ -45,9 +44,8 @@ type rateLimitChecker interface {
 
 // keycloakRealmRuntime is a validated realm binding with its JWKS key source.
 type keycloakRealmRuntime struct {
-	issuer       string
-	jwks         rsaKeyProvider
-	acceptLegacy bool
+	issuer string
+	jwks   rsaKeyProvider
 }
 
 // New creates a new plugin instance.
@@ -95,10 +93,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		plugin.rateLimiter = rl
 	}
 
-	// Identity client
-	plugin.identity = newIdentityClient(config.IdentityServiceURL, httpTimeout, plog)
-
-	// Keycloak dual-issuer path (additive; inert when keycloakApps is empty).
+	// Keycloak realms (per app).
 	kcRealms, err := buildKeycloakAppSet(config)
 	if err != nil {
 		return nil, err
@@ -117,10 +112,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	for app := range kcRealms {
 		r := kcRealms[app]
 		jc := getSharedJWKSCache(r.JWKSURL, httpTimeout, jwksRefresh, jwksCooldown, plog)
-		plugin.keycloakRealms[app] = &keycloakRealmRuntime{issuer: r.Issuer, jwks: jc, acceptLegacy: r.AcceptLegacy}
-		if r.AcceptLegacy {
-			plog.warnf("keycloakRealms[%s].acceptLegacy is deprecated and will be removed: HS256 identity-service tokens are still accepted for this app", app)
-		}
+		plugin.keycloakRealms[app] = &keycloakRealmRuntime{issuer: r.Issuer, jwks: jc}
 	}
 	// Fail the middleware build if any realm is bound to the wrong JWKS cache,
 	// so an interpreter regression surfaces at reload time instead of as 500s.
@@ -194,8 +186,8 @@ func buildKeycloakAppSet(config *Config) (map[string]KeycloakRealm, error) {
 }
 
 // keycloakRealmFor returns the realm the resolved app authenticates against, or
-// nil for legacy (HS256) apps. Unresolved app_id ("" — permissive/disabled modes)
-// always uses the legacy path.
+// nil when the app has none (or the app is unresolved: "" in permissive/disabled
+// modes). nil + bearer token ⇒ 401.
 func (p *GatewayPlugin) keycloakRealmFor(appID string) *keycloakRealmRuntime {
 	if appID == "" {
 		return nil
@@ -206,14 +198,13 @@ func (p *GatewayPlugin) keycloakRealmFor(appID string) *keycloakRealmRuntime {
 // parseKeycloakAuth validates a bearer token against the app's realm (RS256/JWKS).
 func (p *GatewayPlugin) parseKeycloakAuth(realm *keycloakRealmRuntime, authHeader string) (*TokenClaims, error) {
 	if authHeader == "" {
-		return nil, nil // anonymous — same contract as parseJWT
+		return nil, nil // anonymous
 	}
 	return parseKeycloakJWT(authHeader, realm.jwks, realm.issuer, p.config.KeycloakUserIDClaim, p.keycloakLeeway, p.config.KeycloakAdminRoles)
 }
 
-// authzFromTokenRoles synthesizes a UserAuthz from Keycloak token roles without an
-// identity-service round-trip (migration plan §2.3 Phase 1): admins get the
-// wildcard permission — exactly the pre-RBAC fallback already coded in identity.go.
+// authzFromTokenRoles synthesizes a UserAuthz from Keycloak token roles: admins
+// get the wildcard permission.
 func authzFromTokenRoles(claims *TokenClaims) *UserAuthz {
 	authz := &UserAuthz{Roles: claims.Roles, Permissions: []string{}, IsAdmin: claims.IsAdmin}
 	if claims.IsAdmin {
@@ -391,7 +382,7 @@ func (p *GatewayPlugin) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 }
 
 // serveLegacy is the pre-policy authorization engine (authorizationMode
-// "legacy"): keycloakAdminRoles / identity-service authz, host-pinned app,
+// "legacy"): keycloakAdminRoles from token roles, host-pinned app,
 // token.app_id must equal the host app. It additionally computes the policy
 // outcome and logs it as shadow= so bindings can be verified before cutover.
 func (p *GatewayPlugin) serveLegacy(rw http.ResponseWriter, req *http.Request, appID string) {
@@ -417,22 +408,17 @@ func (p *GatewayPlugin) serveLegacy(rw http.ResponseWriter, req *http.Request, a
 		return
 	}
 
-	// 2. Parse JWT (if present). Dual-issuer dispatch by the host-resolved app_id:
-	// Keycloak apps → RS256 + JWKS + that app's realm issuer; everything else → the
-	// legacy HS256 shared-secret path, byte-for-byte unchanged. A realm with the
-	// deprecated acceptLegacy also routes HS256-headed tokens to the legacy
-	// validator; the header only picks the validator, never the verdict. Because each path pins its
-	// algorithm (WithValidMethods), a token from one issuer can never validate on
-	// the other's path (alg-confusion guard in both directions).
+	// 2. Parse JWT (if present) against the resolved app's realm (RS256 + JWKS,
+	// that app's issuer). An app without a realm, or an unresolved app
+	// (permissive/disabled modes), accepts no bearer token at all: 401.
 	var claims *TokenClaims
 	if !p.config.DisableAuth {
 		authHeader := req.Header.Get(p.config.JWTHeaderKey)
 		var err error
-		realm := p.keycloakRealmFor(appID)
-		if realm != nil && !(realm.acceptLegacy && tokenAlg(authHeader) == "HS256") {
+		if realm := p.keycloakRealmFor(appID); realm != nil {
 			claims, err = p.parseKeycloakAuth(realm, authHeader)
-		} else {
-			claims, err = parseJWT(authHeader, p.config.JWTSecret, p.config.JWTIssuer)
+		} else if authHeader != "" {
+			err = errIssuerNotAccepted
 		}
 		if err != nil {
 			p.log.errorf("jwt auth failure path=%s reason=issuer_rejected error=%v", req.URL.Path, err)
@@ -445,8 +431,7 @@ func (p *GatewayPlugin) serveLegacy(rw http.ResponseWriter, req *http.Request, a
 		if claims != nil {
 			// 2a. Cross-app token replay check (guide §8.5): a token minted for one
 			// app must not be accepted on another app's host. Enforced only when both
-			// sides are known — legacy tokens without the claim (claims.AppID == "")
-			// and unresolved hosts (appID == "", permissive/disabled) pass through.
+			// sides are known — tokens without the claim (claims.AppID == "") pass.
 			if claims.AppID != "" && appID != "" && claims.AppID != appID {
 				p.log.warnf("jwt app mismatch path=%s reason=issuer_rejected user_id=%s token_app_id=%s host_app_id=%s", req.URL.Path, claims.UserID, claims.AppID, appID)
 				writeJSON(rw, http.StatusUnauthorized, map[string]string{
@@ -470,15 +455,12 @@ func (p *GatewayPlugin) serveLegacy(rw http.ResponseWriter, req *http.Request, a
 
 	// 3. Permission check (RBAC v2, PERMISSIONS_STRATEGY.md). An endpoint may
 	// require a permission tag from the snapshot; the legacy admin access level
-	// implies config.AdminPermission. Fail closed: no claims → 401, identity
-	// unavailable or permission missing → 403.
+	// implies config.AdminPermission. Fail closed: no claims → 401, permission
+	// missing → 403. Roles/admin come from the token (keycloakAdminRoles).
 	requiredPermission := ep.RequiredPermission
 	if requiredPermission == "" && ep.AccessLevel == p.config.AdminAccessLevel {
 		requiredPermission = p.config.AdminPermission
 	}
-	// authzStamped records that the permission gate below already resolved and
-	// stamped the caller's admin/roles headers, so step 4 does not repeat it.
-	authzStamped := false
 	if requiredPermission != "" {
 		if claims == nil {
 			p.log.warnf("permission-gated endpoint requires auth path=%s reason=no_token app_id=%s permission=%s", req.URL.Path, appID, requiredPermission)
@@ -488,22 +470,9 @@ func (p *GatewayPlugin) serveLegacy(rw http.ResponseWriter, req *http.Request, a
 			})
 			return
 		}
-		var authz *UserAuthz
-		var err error
-		if claims.Keycloak {
-			// Keycloak tokens carry their roles; no identity-service round-trip
-			// (migration plan §2.3 Phase 1 — admin ⇒ wildcard permission).
-			authz = authzFromTokenRoles(claims)
-		} else {
-			authz, err = p.identity.Authz(ctx, appID, claims.UserID)
-			if err != nil {
-				p.log.warnf("identity authz check failed user_id=%s error=%v", claims.UserID, err)
-			}
-		}
-		if err != nil || !authz.Has(requiredPermission) {
-			if err == nil {
-				p.log.warnf("permission denied reason=no_matching_statement user_id=%s path=%s app_id=%s required=%s roles=%v", claims.UserID, req.URL.Path, appID, requiredPermission, authz.Roles)
-			}
+		authz := authzFromTokenRoles(claims)
+		if !authz.Has(requiredPermission) {
+			p.log.warnf("permission denied reason=no_matching_statement user_id=%s path=%s app_id=%s required=%s roles=%v", claims.UserID, req.URL.Path, appID, requiredPermission, authz.Roles)
 			writeJSON(rw, http.StatusForbidden, map[string]string{
 				"error":   "forbidden",
 				"message": "insufficient permissions",
@@ -511,8 +480,6 @@ func (p *GatewayPlugin) serveLegacy(rw http.ResponseWriter, req *http.Request, a
 			return
 		}
 		p.log.infof("permission granted user_id=%s path=%s permission=%s", claims.UserID, req.URL.Path, requiredPermission)
-		p.stampAuthzHeaders(req, authz)
-		authzStamped = true
 	}
 
 	// 4. Determine rate-limit identity and plan
@@ -524,25 +491,13 @@ func (p *GatewayPlugin) serveLegacy(rw http.ResponseWriter, req *http.Request, a
 		planName = p.planResolver.Resolve(ctx, appID, claims.UserID, p.config.DefaultPlanName)
 		req.Header.Set(p.config.UserIDHeader, claims.UserID)
 		req.Header.Set(p.config.UserPlanHeader, planName)
-		if claims.Keycloak {
-			// Keycloak tokens carry admin/roles directly (frozen header contract:
-			// same X-Is-Admin/X-User-Roles the identity-service path stamps).
-			p.stampAuthzHeaders(req, authzFromTokenRoles(claims))
-			req.Header.Set(p.config.UserUIDHeader, claims.Subject)
-			if p.config.UserEmailHeader != "" && claims.Email != "" {
-				req.Header.Set(p.config.UserEmailHeader, claims.Email)
-			}
-		} else if !authzStamped {
-			// Legacy tokens: stamp the same admin/roles contract on EVERY
-			// authenticated request, not only on permission-gated endpoints, so
-			// a public endpoint can offer an admin-only behaviour (e.g. the
-			// file-service download ignoring retention expiry for operators).
-			// Fail-soft by design: identity unavailable ⇒ headers absent and the
-			// caller is treated as a regular user; a public endpoint must never
-			// turn into an error because of this lookup.
-			if authz := p.identity.AuthzSoft(ctx, appID, claims.UserID); authz != nil {
-				p.stampAuthzHeaders(req, authz)
-			}
+		// Admin/roles headers on EVERY authenticated request (frozen header
+		// contract X-Is-Admin / X-User-Roles), so a public endpoint can offer an
+		// admin-only behaviour (e.g. file-service download ignoring retention).
+		p.stampAuthzHeaders(req, authzFromTokenRoles(claims))
+		req.Header.Set(p.config.UserUIDHeader, claims.Subject)
+		if p.config.UserEmailHeader != "" && claims.Email != "" {
+			req.Header.Set(p.config.UserEmailHeader, claims.Email)
 		}
 		// Remove any client-supplied session header so backends can trust X-User-Id alone.
 		req.Header.Del(p.config.SessionIDHeader)

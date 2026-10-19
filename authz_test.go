@@ -116,19 +116,7 @@ func TestPermissionsByApp(t *testing.T) {
 	}
 }
 
-func TestLegacyAndAPIKeyAdapters(t *testing.T) {
-	admin := &principal{homeApp: "fileconvert", statements: legacyStatements(&UserAuthz{Roles: []string{"admin"}, Permissions: []string{"*"}, IsAdmin: true})}
-	if !admin.isWildcard("fileconvert") || admin.isWildcard("scantinel") || !admin.granted("anything.at", "fileconvert") {
-		t.Fatal("legacy admin: * on @home only")
-	}
-	mod := &principal{homeApp: "fileconvert", statements: legacyStatements(&UserAuthz{Permissions: []string{"content.moderate"}})}
-	if !mod.granted("content.moderate", "fileconvert") || mod.granted("content.moderate", "scantinel") || !mod.granted("authenticated", "fileconvert") || mod.isWildcard("fileconvert") {
-		t.Fatal("legacy moderator: reported permissions + authenticated on @home")
-	}
-	down := &principal{homeApp: "fileconvert", statements: legacyStatements(nil)}
-	if down.granted("authenticated", "fileconvert") {
-		t.Fatal("identity unavailable ⇒ no statements")
-	}
+func TestAPIKeyAdapter(t *testing.T) {
 	key := &principal{homeApp: "fileconvert", statements: apiKeyStatements()}
 	if !key.granted("authenticated", "fileconvert") || key.granted("authenticated", "scantinel") || key.granted("content.read", "fileconvert") || key.isWildcard("fileconvert") {
 		t.Fatal("api key: authenticated on its own app only")

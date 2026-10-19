@@ -234,7 +234,6 @@ func mockIdentityVerify(t *testing.T, status int, body map[string]interface{}) (
 func newAPIKeyPlugin(t *testing.T, next http.Handler, verifyURL string, cache *respRedis) *GatewayPlugin {
 	t.Helper()
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 	config.IdentityVerifyURL = verifyURL
 	return &GatewayPlugin{
@@ -243,7 +242,6 @@ func newAPIKeyPlugin(t *testing.T, next http.Handler, verifyURL string, cache *r
 		config:      config,
 		snapshot:    setupTestSnapshot(),
 		appRegistry: setupTestAppRegistry(),
-		identity:    newIdentityClient("http://localhost:9999", 1*time.Second, nil),
 		planResolver: &PlanResolver{
 			cache: make(map[string]planCacheEntry),
 		},
@@ -362,7 +360,6 @@ func TestPlugin_APIKey_StripsSpoofedUid_Matched(t *testing.T) {
 // Spoofed X-Api-Key-Uid on an anonymous matched request (no key) must be stripped.
 func TestPlugin_APIKey_StripsSpoofedUid_Anonymous(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 
 	var gotUID string
@@ -373,7 +370,6 @@ func TestPlugin_APIKey_StripsSpoofedUid_Anonymous(t *testing.T) {
 	plugin := &GatewayPlugin{
 		next: next, name: "test", config: config,
 		snapshot:     setupTestSnapshot(),
-		identity:     newIdentityClient("http://localhost:9999", 1*time.Second, nil),
 		planResolver: &PlanResolver{cache: make(map[string]planCacheEntry)},
 	}
 
@@ -392,7 +388,6 @@ func TestPlugin_APIKey_StripsSpoofedUid_Anonymous(t *testing.T) {
 // Spoofed X-Api-Key-Uid on the pass-through (unmatched) path must be stripped.
 func TestPlugin_APIKey_StripsSpoofedUid_PassThrough(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 
 	var gotUID string
@@ -421,7 +416,6 @@ func TestPlugin_APIKey_StripsSpoofedUid_PassThrough(t *testing.T) {
 // Spoofed X-Api-Key-Uid on an error path (unknown host enforce → 403) never reaches a backend.
 func TestPlugin_APIKey_StripsSpoofedUid_ErrorPath(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 	config.AppResolutionMode = "enforce"
 
@@ -693,19 +687,18 @@ func TestPlugin_APIKey_JWTPathUnaffected(t *testing.T) {
 	})
 
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
+	realm := newTestRealm(t)
 	config.DisableRateLimit = true
 	config.IdentityVerifyURL = "http://127.0.0.1:1/internal/v1/api-keys/verify"
-	plugin := &GatewayPlugin{
+	plugin := realm.wire(&GatewayPlugin{
 		next: next, name: "test", config: config,
 		snapshot:     setupTestSnapshot(),
 		appRegistry:  setupTestAppRegistry(),
-		identity:     newIdentityClient("http://localhost:9999", 1*time.Second, nil),
 		planResolver: newPlanResolver(serviceServer.URL, 5*time.Second, nil),
 		apiKeys:      newAPIKeyVerifier("http://127.0.0.1:1/internal/v1/api-keys/verify", 2*time.Second, nil, "gw:rl:", nil),
-	}
+	})
 
-	token := createTestToken("test-secret", 99, "file-convert.online", time.Now().Add(time.Hour))
+	token := realm.token(t, "99", nil)
 	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
 	req.Host = "fileconvert.online"
 	req.Header.Set("Authorization", "Bearer "+token)

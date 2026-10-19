@@ -56,52 +56,48 @@ func TestOwnerMatches(t *testing.T) {
 
 // Legacy HS256 path: regular user own id / other id / admin any id / anonymous,
 // spoofed X-Is-Admin, query form, and owner+admin gate interaction.
-func TestPlugin_OwnerGate_Legacy(t *testing.T) {
-	admin := newAuthzIdentityServer(t, []string{"Admin"}, []string{"*"}, true, http.StatusOK)
-	defer admin.Close()
-	user := newAuthzIdentityServer(t, []string{"User"}, []string{}, false, http.StatusOK)
-	defer user.Close()
+func TestPlugin_OwnerGate_Tokens(t *testing.T) {
+	realm := newTestRealm(t)
 	plans := newPlanServer(t)
 	defer plans.Close()
 
-	newP := func(identityURL string, forwarded *bool) *GatewayPlugin {
+	newP := func(forwarded *bool) *GatewayPlugin {
 		config := CreateConfig()
-		config.JWTSecret = "test-secret"
 		config.DisableRateLimit = true
-		config.AppResolutionMode = "disabled"
-		return &GatewayPlugin{
+		return realm.wire(&GatewayPlugin{
 			next:         http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) { *forwarded = true; rw.WriteHeader(http.StatusOK) }),
 			name:         "test",
 			config:       config,
 			snapshot:     setupTestSnapshot(),
-			identity:     newIdentityClient(identityURL, 5*time.Second, nil),
 			planResolver: newPlanResolver(plans.URL, 5*time.Second, nil),
-		}
+		})
 	}
-	tok42 := createTestToken("test-secret", 42, "file-convert.online", time.Now().Add(time.Hour))
+	tok42 := realm.token(t, "42", nil)
+	adm42 := realm.admin(t, "42")
 
 	cases := []struct {
-		name, identity, url, token string
-		hdr                        map[string]string
-		want                       int
+		name, url, token string
+		hdr              map[string]string
+		want             int
 	}{
-		{"own id", user.URL, "/api/conversion/v1/user/42", tok42, nil, 200},
-		{"other id", user.URL, "/api/conversion/v1/user/43", tok42, nil, 403},
-		{"padded id", user.URL, "/api/conversion/v1/user/042", tok42, nil, 403},
-		{"forged admin header", user.URL, "/api/conversion/v1/user/43", tok42, map[string]string{"X-Is-Admin": "true", "X-User-Roles": "admin"}, 403},
-		{"admin any id", admin.URL, "/api/conversion/v1/user/43", tok42, nil, 200},
-		{"anonymous", user.URL, "/api/conversion/v1/user/42", "", nil, 401},
-		{"query own", user.URL, "/api/conversion/v1/owned?user_id=42", tok42, nil, 200},
-		{"query other", user.URL, "/api/conversion/v1/owned?user_id=1", tok42, nil, 403},
-		{"query absent", user.URL, "/api/conversion/v1/owned", tok42, nil, 403},
-		{"admin+owner gate, non-admin own id", user.URL, "/api/conversion/v1/admin/user/42", tok42, nil, 403},
-		{"admin+owner gate, admin other id", admin.URL, "/api/conversion/v1/admin/user/43", tok42, nil, 200},
+		{"own id", "/api/conversion/v1/user/42", tok42, nil, 200},
+		{"other id", "/api/conversion/v1/user/43", tok42, nil, 403},
+		{"padded id", "/api/conversion/v1/user/042", tok42, nil, 403},
+		{"forged admin header", "/api/conversion/v1/user/43", tok42, map[string]string{"X-Is-Admin": "true", "X-User-Roles": "admin"}, 403},
+		{"admin any id", "/api/conversion/v1/user/43", adm42, nil, 200},
+		{"anonymous", "/api/conversion/v1/user/42", "", nil, 401},
+		{"query own", "/api/conversion/v1/owned?user_id=42", tok42, nil, 200},
+		{"query other", "/api/conversion/v1/owned?user_id=1", tok42, nil, 403},
+		{"query absent", "/api/conversion/v1/owned", tok42, nil, 403},
+		{"admin+owner gate, non-admin own id", "/api/conversion/v1/admin/user/42", tok42, nil, 403},
+		{"admin+owner gate, admin other id", "/api/conversion/v1/admin/user/43", adm42, nil, 200},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			forwarded := false
-			p := newP(c.identity, &forwarded)
+			p := newP(&forwarded)
 			req := httptest.NewRequest(http.MethodGet, c.url, nil)
+			req.Host = "fileconvert.online"
 			if c.token != "" {
 				req.Header.Set("Authorization", "Bearer "+c.token)
 			}
@@ -117,37 +113,6 @@ func TestPlugin_OwnerGate_Legacy(t *testing.T) {
 				t.Errorf("forwarded=%v for status %d", forwarded, c.want)
 			}
 		})
-	}
-}
-
-// Identity down: admin cannot be confirmed ⇒ treated as non-admin ⇒ owner
-// equality still enforced (fail-soft never widens access).
-func TestPlugin_OwnerGate_IdentityDown_EnforcesOwner(t *testing.T) {
-	down := newAuthzIdentityServer(t, nil, nil, false, http.StatusInternalServerError)
-	down.Close() // unreachable
-	plans := newPlanServer(t)
-	defer plans.Close()
-	config := CreateConfig()
-	config.JWTSecret = "test-secret"
-	config.DisableRateLimit = true
-	config.AppResolutionMode = "disabled"
-	p := &GatewayPlugin{
-		next:         http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) { rw.WriteHeader(http.StatusOK) }),
-		name:         "test",
-		config:       config,
-		snapshot:     setupTestSnapshot(),
-		identity:     newIdentityClient(down.URL, time.Second, nil),
-		planResolver: newPlanResolver(plans.URL, 5*time.Second, nil),
-	}
-	tok := createTestToken("test-secret", 42, "file-convert.online", time.Now().Add(time.Hour))
-	for url, want := range map[string]int{"/api/conversion/v1/user/42": 200, "/api/conversion/v1/user/43": 403} {
-		req := httptest.NewRequest(http.MethodGet, url, nil)
-		req.Header.Set("Authorization", "Bearer "+tok)
-		rr := httptest.NewRecorder()
-		p.ServeHTTP(rr, req)
-		if rr.Code != want {
-			t.Errorf("%s: got %d want %d", url, rr.Code, want)
-		}
 	}
 }
 
@@ -183,7 +148,7 @@ func TestPlugin_OwnerGate_Keycloak(t *testing.T) {
 	ts1.newKey("kid-s")
 	k2 := ts2.newKey("kid-f")
 	next := http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) { rw.WriteHeader(http.StatusOK) })
-	p := newTwoRealmPlugin(t, ts1, ts2, false, next)
+	p := newTwoRealmPlugin(t, ts1, ts2, next)
 
 	userClaims := fcClaims()
 	userClaims["realm_access"] = map[string]interface{}{"roles": []interface{}{"user"}}

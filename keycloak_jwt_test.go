@@ -278,7 +278,7 @@ func TestParseKeycloakJWT_HS256Rejected(t *testing.T) {
 	ts.newKey("kid-1")
 	jc := ts.cache(30 * time.Second)
 
-	token := createTestTokenWithApp("legacy-secret", 42, testKeycloakIssuer, "scantinel", time.Now().Add(time.Hour))
+	token := mintHS256Token("legacy-secret", 42, testKeycloakIssuer, "scantinel", time.Now().Add(time.Hour))
 	_, err := parseKeycloakJWT("Bearer "+token, jc, testKeycloakIssuer, "luid", 30*time.Second, defaultAdminRoles())
 	if err == nil {
 		t.Fatal("expected HS256 token to be rejected on the Keycloak path")
@@ -444,9 +444,9 @@ func TestBuildKeycloakAppSet(t *testing.T) {
 		KeycloakApps:    []string{"scantinel"},
 		KeycloakJWKSURL: "http://kc/certs",
 		KeycloakIssuer:  testKeycloakIssuer,
-		KeycloakRealms:  []KeycloakRealm{{AppID: "fileconvert", Issuer: testFCIssuer, JWKSURL: "http://kc/fc/certs", AcceptLegacy: true}},
+		KeycloakRealms:  []KeycloakRealm{{AppID: "fileconvert", Issuer: testFCIssuer, JWKSURL: "http://kc/fc/certs"}},
 	})
-	if err != nil || len(apps) != 2 || apps["fileconvert"].Issuer != testFCIssuer || !apps["fileconvert"].AcceptLegacy || apps["scantinel"].Issuer != testKeycloakIssuer {
+	if err != nil || len(apps) != 2 || apps["fileconvert"].Issuer != testFCIssuer || apps["scantinel"].Issuer != testKeycloakIssuer {
 		t.Fatalf("expected two realms, got %v, %v", apps, err)
 	}
 	for _, bad := range []KeycloakRealm{{Issuer: testFCIssuer, JWKSURL: "u"}, {AppID: "fileconvert", JWKSURL: "u"}, {AppID: "fileconvert", Issuer: testFCIssuer}} {
@@ -517,7 +517,6 @@ func setupDualAppRegistry() *AppRegistryCache {
 // newDualIssuerPlugin builds a hand-wired plugin with both auth paths active.
 func newDualIssuerPlugin(t *testing.T, ts *testJWKSServer, next http.Handler) *GatewayPlugin {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 	config.KeycloakApps = []string{"scantinel"}
 	config.KeycloakJWKSURL = ts.srv.URL
@@ -535,7 +534,7 @@ func wirePlugin(t *testing.T, config *Config, next http.Handler, caches map[stri
 	}
 	realms := map[string]*keycloakRealmRuntime{}
 	for app, r := range kcRealms {
-		realms[app] = &keycloakRealmRuntime{issuer: r.Issuer, jwks: caches[r.JWKSURL], acceptLegacy: r.AcceptLegacy}
+		realms[app] = &keycloakRealmRuntime{issuer: r.Issuer, jwks: caches[r.JWKSURL]}
 	}
 	return &GatewayPlugin{
 		next:           next,
@@ -543,7 +542,6 @@ func wirePlugin(t *testing.T, config *Config, next http.Handler, caches map[stri
 		config:         config,
 		snapshot:       setupDualAppSnapshot(),
 		appRegistry:    setupDualAppRegistry(),
-		identity:       newIdentityClient("http://localhost:9999", 1*time.Second, nil),
 		planResolver:   newPlanResolver("http://localhost:9999", 1*time.Second, nil),
 		keycloakRealms: realms,
 		keycloakLeeway: time.Duration(config.KeycloakClockSkewSeconds) * time.Second,
@@ -644,7 +642,7 @@ func TestPlugin_Keycloak_HS256TokenOnScantinelHost_401(t *testing.T) {
 	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) { rw.WriteHeader(http.StatusOK) })
 	plugin := newDualIssuerPlugin(t, ts, next)
 
-	token := createTestTokenWithApp("test-secret", 42, "file-convert.online", "scantinel", time.Now().Add(time.Hour))
+	token := mintHS256Token("test-secret", 42, "file-convert.online", "scantinel", time.Now().Add(time.Hour))
 	req := httptest.NewRequest(http.MethodPost, "http://scantinel.ai/api/scan/v1/scans", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 	rr := httptest.NewRecorder()
@@ -706,47 +704,37 @@ func TestPlugin_Keycloak_AdminEndpoint_TokenRoles(t *testing.T) {
 	}
 }
 
-// REGRESSION: with the Keycloak path fully configured, fileconvert HS256 tokens
-// still validate and stamp headers exactly as before.
-func TestPlugin_HS256Fileconvert_UnchangedWithKeycloakConfigured(t *testing.T) {
+// An app with NO realm (fileconvert in newDualIssuerPlugin) accepts no bearer
+// token at all — HS256 or a valid RS256 token of another realm — while
+// anonymous requests still pass free endpoints.
+func TestPlugin_NoRealmApp_BearerRejected(t *testing.T) {
 	ts := newTestJWKSServer(t)
-	ts.newKey("kid-1")
-
-	var gotUserID, gotAppID string
-	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		gotUserID = req.Header.Get("X-User-Id")
-		gotAppID = req.Header.Get("X-App-Id")
-		rw.WriteHeader(http.StatusOK)
-	})
+	key := ts.newKey("kid-1")
+	var hits int
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) { hits++; rw.WriteHeader(http.StatusOK) })
 	plugin := newDualIssuerPlugin(t, ts, next)
 
-	token := createTestTokenWithApp("test-secret", 42, "file-convert.online", "fileconvert", time.Now().Add(time.Hour))
+	for name, token := range map[string]string{
+		"hs256":           mintHS256Token("test-secret", 42, "file-convert.online", "fileconvert", time.Now().Add(time.Hour)),
+		"rs256-scantinel": mintKeycloakToken(t, key, "kid-1", keycloakClaims(time.Now().Add(time.Hour))),
+	} {
+		req := httptest.NewRequest(http.MethodPost, "http://fileconvert.online/api/conversion/v1/convert", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rr := httptest.NewRecorder()
+		plugin.ServeHTTP(rr, req)
+		if rr.Code != http.StatusUnauthorized {
+			t.Fatalf("%s on app without realm: expected 401, got %d: %s", name, rr.Code, rr.Body.String())
+		}
+	}
+	if hits != 0 {
+		t.Fatal("request reached the backend")
+	}
 	req := httptest.NewRequest(http.MethodPost, "http://fileconvert.online/api/conversion/v1/convert", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-Session-Id", "sess-1")
 	rr := httptest.NewRecorder()
-
 	plugin.ServeHTTP(rr, req)
-
 	if rr.Code != http.StatusOK {
-		t.Fatalf("expected 200 for legacy HS256 token, got %d: %s", rr.Code, rr.Body.String())
-	}
-	if gotUserID != "42" {
-		t.Errorf("expected X-User-Id=42, got %q", gotUserID)
-	}
-	if gotAppID != "fileconvert" {
-		t.Errorf("expected X-App-Id=fileconvert, got %q", gotAppID)
-	}
-
-	// And the reverse replay: an RS256 scantinel token on the fileconvert host
-	// hits the HS256 validator and fails → 401.
-	key := ts.newKey("kid-2")
-	kcToken := mintKeycloakToken(t, key, "kid-2", keycloakClaims(time.Now().Add(time.Hour)))
-	req = httptest.NewRequest(http.MethodPost, "http://fileconvert.online/api/conversion/v1/convert", nil)
-	req.Header.Set("Authorization", "Bearer "+kcToken)
-	rr = httptest.NewRecorder()
-	plugin.ServeHTTP(rr, req)
-	if rr.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 for RS256 token on HS256 app, got %d", rr.Code)
+		t.Fatalf("anonymous on app without realm: expected 200, got %d", rr.Code)
 	}
 }
 
@@ -784,15 +772,14 @@ func TestNumericUserID(t *testing.T) {
 // --- per-app realms (scantinel + fileconvert on different realms) ------------
 
 // newTwoRealmPlugin: scantinel on the scalar realm (ts1), fileconvert on its own
-// realm (ts2) via keycloakRealms, optionally accepting legacy HS256 tokens.
-func newTwoRealmPlugin(t *testing.T, ts1, ts2 *testJWKSServer, acceptLegacy bool, next http.Handler) *GatewayPlugin {
+// realm (ts2) via keycloakRealms.
+func newTwoRealmPlugin(t *testing.T, ts1, ts2 *testJWKSServer, next http.Handler) *GatewayPlugin {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 	config.KeycloakApps = []string{"scantinel"}
 	config.KeycloakJWKSURL = ts1.srv.URL
 	config.KeycloakIssuer = testKeycloakIssuer
-	config.KeycloakRealms = []KeycloakRealm{{AppID: "fileconvert", Issuer: testFCIssuer, JWKSURL: ts2.srv.URL, AcceptLegacy: acceptLegacy}}
+	config.KeycloakRealms = []KeycloakRealm{{AppID: "fileconvert", Issuer: testFCIssuer, JWKSURL: ts2.srv.URL}}
 	return wirePlugin(t, config, next, map[string]rsaKeyProvider{ts1.srv.URL: ts1.cache(0), ts2.srv.URL: ts2.cache(0)})
 }
 
@@ -833,7 +820,7 @@ func TestPlugin_TwoRealms_EachTokenOnlyValidOnItsRealm(t *testing.T) {
 		got = req.Header.Clone()
 		rw.WriteHeader(http.StatusOK)
 	})
-	p := newTwoRealmPlugin(t, ts1, ts2, false, next)
+	p := newTwoRealmPlugin(t, ts1, ts2, next)
 
 	fcTok := mintKeycloakToken(t, k2, "kid-f", fcClaims())
 	scTok := mintKeycloakToken(t, k1, "kid-s", keycloakClaims(time.Now().Add(time.Hour)))
@@ -875,56 +862,22 @@ func TestPlugin_TwoRealms_EachTokenOnlyValidOnItsRealm(t *testing.T) {
 	}
 }
 
-func TestPlugin_TwoRealms_LegacyHS256(t *testing.T) {
+func TestPlugin_TwoRealms_HS256Rejected(t *testing.T) {
 	ts1, ts2 := newTestJWKSServer(t), newTestJWKSServer(t)
 	ts1.newKey("kid-s")
-	k2 := ts2.newKey("kid-f")
-	var got http.Header
-	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		got = req.Header.Clone()
-		rw.WriteHeader(http.StatusOK)
-	})
-	legacy := createTestTokenWithApp("test-secret", 7, "file-convert.online", "fileconvert", time.Now().Add(time.Hour))
+	ts2.newKey("kid-f")
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) { rw.WriteHeader(http.StatusOK) })
+	p := newTwoRealmPlugin(t, ts1, ts2, next)
 
-	// acceptLegacy=false: fileconvert is Keycloak-only → HS256 rejected.
-	strict := newTwoRealmPlugin(t, ts1, ts2, false, next)
-	if rr := serve(strict, fcURL, legacy, nil); rr.Code != http.StatusUnauthorized {
-		t.Fatalf("HS256 on keycloak-only fc: expected 401, got %d", rr.Code)
+	legacy := mintHS256Token("test-secret", 7, "file-convert.online", "fileconvert", time.Now().Add(time.Hour))
+	if rr := serve(p, fcURL, legacy, nil); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("HS256 on fc: expected 401, got %d", rr.Code)
 	}
-
-	// acceptLegacy=true: both token kinds work on the fc host.
-	dual := newTwoRealmPlugin(t, ts1, ts2, true, next)
-	if rr := serve(dual, fcURL, legacy, map[string]string{"X-User-Uid": "spoof"}); rr.Code != http.StatusOK {
-		t.Fatalf("HS256 on dual fc: expected 200, got %d: %s", rr.Code, rr.Body.String())
-	}
-	if got.Get("X-User-Id") != "7" || got.Get("X-User-Uid") != "" {
-		t.Errorf("legacy path: X-User-Id=%q (want 7), X-User-Uid=%q (want empty)", got.Get("X-User-Id"), got.Get("X-User-Uid"))
-	}
-	if rr := serve(dual, fcURL, mintKeycloakToken(t, k2, "kid-f", fcClaims()), nil); rr.Code != http.StatusOK {
-		t.Fatalf("RS256 on dual fc: expected 200, got %d: %s", rr.Code, rr.Body.String())
-	}
-	// Wrong-secret HS256 still fails on the legacy validator.
-	if rr := serve(dual, fcURL, createTestTokenWithApp("wrong", 7, "file-convert.online", "fileconvert", time.Now().Add(time.Hour)), nil); rr.Code != http.StatusUnauthorized {
-		t.Fatalf("bad HS256 on dual fc: expected 401, got %d", rr.Code)
-	}
-	// acceptLegacy on fileconvert must not open the legacy path for scantinel.
-	if rr := serve(dual, scanURL, createTestTokenWithApp("test-secret", 7, "file-convert.online", "scantinel", time.Now().Add(time.Hour)), nil); rr.Code != http.StatusUnauthorized {
+	if rr := serve(p, scanURL, mintHS256Token("test-secret", 7, "file-convert.online", "scantinel", time.Now().Add(time.Hour)), nil); rr.Code != http.StatusUnauthorized {
 		t.Fatalf("HS256 on scantinel host: expected 401, got %d", rr.Code)
 	}
-	// alg=none / garbage header on the dual app goes to the RS256 validator → 401.
-	if rr := serve(dual, fcURL, "eyJhbGciOiJub25lIn0.e30.", nil); rr.Code != http.StatusUnauthorized {
-		t.Fatalf("alg=none on dual fc: expected 401, got %d", rr.Code)
-	}
-}
-
-func TestTokenAlg(t *testing.T) {
-	legacy := createTestTokenWithApp("s", 1, "i", "a", time.Now().Add(time.Hour))
-	if a := tokenAlg("Bearer " + legacy); a != "HS256" {
-		t.Errorf("want HS256, got %q", a)
-	}
-	for _, bad := range []string{"", "Bearer ", "Bearer x", "Bearer !!!.e30.x"} {
-		if a := tokenAlg(bad); a != "" {
-			t.Errorf("tokenAlg(%q) = %q, want empty", bad, a)
-		}
+	// alg=none / garbage header → 401.
+	if rr := serve(p, fcURL, "eyJhbGciOiJub25lIn0.e30.", nil); rr.Code != http.StatusUnauthorized {
+		t.Fatalf("alg=none on fc: expected 401, got %d", rr.Code)
 	}
 }

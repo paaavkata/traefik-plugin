@@ -32,7 +32,6 @@ func TestPlugin_ColdSnapshot_EnforceFailsClosed(t *testing.T) {
 	}
 
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 	config.AppResolutionMode = "enforce"
 
@@ -76,7 +75,6 @@ func TestPlugin_ColdSnapshot_EnforceFailsClosed(t *testing.T) {
 // Permissive mode keeps today's behaviour: a cold snapshot passes through.
 func TestPlugin_ColdSnapshot_PermissivePassesThrough(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 	config.AppResolutionMode = "permissive"
 	sc := &SnapshotCache{stopCh: make(chan struct{})}

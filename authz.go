@@ -187,29 +187,6 @@ func (p *principal) resolveStatements(idx *policyIndex) {
 	}
 }
 
-// legacyStatements synthesizes the statement set of a legacy (identity-service)
-// principal: its reported permissions become actions on @home; is_admin adds
-// "*" on @home. nil authz (identity unavailable) ⇒ no statements.
-func legacyStatements(authz *UserAuthz) []Statement {
-	if authz == nil {
-		return nil
-	}
-	actions := []string{}
-	for _, perm := range authz.Permissions {
-		if perm == "*" {
-			actions = append(actions, "*")
-			continue
-		}
-		actions = append(actions, perm)
-	}
-	if authz.IsAdmin {
-		actions = append(actions, "*")
-	}
-	// Every authenticated legacy user is at least a tenant user.
-	actions = append(actions, permAuthenticated)
-	return []Statement{{Actions: actions, Apps: []string{appHome}}}
-}
-
 // apiKeyStatements: an API key is a tenant user of its bound application.
 func apiKeyStatements() []Statement {
 	return []Statement{{Actions: []string{permAuthenticated}, Apps: []string{appHome}}}

@@ -3,11 +3,8 @@ package traefik_gateway_plugin
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -131,7 +128,6 @@ func setupTestAppRegistry() *AppRegistryCache {
 
 func TestPlugin_AnonymousRequest_FreeEndpoint(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 
 	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
@@ -143,7 +139,6 @@ func TestPlugin_AnonymousRequest_FreeEndpoint(t *testing.T) {
 		name:     "test",
 		config:   config,
 		snapshot: setupTestSnapshot(),
-		identity: newIdentityClient("http://localhost:9999", 1*time.Second, nil),
 		planResolver: &PlanResolver{
 			cache: make(map[string]planCacheEntry),
 		},
@@ -162,7 +157,6 @@ func TestPlugin_AnonymousRequest_FreeEndpoint(t *testing.T) {
 
 func TestPlugin_AdminEndpoint_NoAuth(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 
 	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
@@ -174,7 +168,6 @@ func TestPlugin_AdminEndpoint_NoAuth(t *testing.T) {
 		name:     "test",
 		config:   config,
 		snapshot: setupTestSnapshot(),
-		identity: newIdentityClient("http://localhost:9999", 1*time.Second, nil),
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/conversion/v1/admin/users", nil)
@@ -189,33 +182,23 @@ func TestPlugin_AdminEndpoint_NoAuth(t *testing.T) {
 
 func TestPlugin_AdminEndpoint_NonAdminUser(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
+	realm := newTestRealm(t)
 	config.DisableRateLimit = true
-
-	// Mock identity service returns non-admin
-	identityServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "success",
-			"message": "ok",
-			"data":    map[string]bool{"is_admin": false},
-		})
-	}))
-	defer identityServer.Close()
 
 	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		rw.WriteHeader(http.StatusOK)
 	})
 
-	plugin := &GatewayPlugin{
+	plugin := realm.wire(&GatewayPlugin{
 		next:     next,
 		name:     "test",
 		config:   config,
 		snapshot: setupTestSnapshot(),
-		identity: newIdentityClient(identityServer.URL, 5*time.Second, nil),
-	}
+	})
 
-	token := createTestToken("test-secret", 42, "file-convert.online", time.Now().Add(time.Hour))
+	token := realm.token(t, "42", nil)
 	req := httptest.NewRequest(http.MethodGet, "/api/conversion/v1/admin/users", nil)
+	req.Host = "fileconvert.online"
 	req.Header.Set("Authorization", "Bearer "+token)
 	rr := httptest.NewRecorder()
 
@@ -228,17 +211,8 @@ func TestPlugin_AdminEndpoint_NonAdminUser(t *testing.T) {
 
 func TestPlugin_AdminEndpoint_AdminUser(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
+	realm := newTestRealm(t)
 	config.DisableRateLimit = true
-
-	identityServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  "success",
-			"message": "ok",
-			"data":    map[string]bool{"is_admin": true},
-		})
-	}))
-	defer identityServer.Close()
 
 	var capturedIsAdmin string
 	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
@@ -252,17 +226,17 @@ func TestPlugin_AdminEndpoint_AdminUser(t *testing.T) {
 	}))
 	defer serviceServer.Close()
 
-	plugin := &GatewayPlugin{
+	plugin := realm.wire(&GatewayPlugin{
 		next:         next,
 		name:         "test",
 		config:       config,
 		snapshot:     setupTestSnapshot(),
-		identity:     newIdentityClient(identityServer.URL, 5*time.Second, nil),
 		planResolver: newPlanResolver(serviceServer.URL, 5*time.Second, nil),
-	}
+	})
 
-	token := createTestToken("test-secret", 42, "file-convert.online", time.Now().Add(time.Hour))
+	token := realm.admin(t, "42")
 	req := httptest.NewRequest(http.MethodGet, "/api/conversion/v1/admin/users", nil)
+	req.Host = "fileconvert.online"
 	req.Header.Set("Authorization", "Bearer "+token)
 	rr := httptest.NewRecorder()
 
@@ -278,7 +252,6 @@ func TestPlugin_AdminEndpoint_AdminUser(t *testing.T) {
 
 func TestPlugin_InvalidJWT(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 
 	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
@@ -305,28 +278,24 @@ func TestPlugin_InvalidJWT(t *testing.T) {
 
 func TestPlugin_ExpiredJWT(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
+	realm := newTestRealm(t)
 	config.DisableRateLimit = true
 
 	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		rw.WriteHeader(http.StatusOK)
 	})
 
-	plugin := &GatewayPlugin{
+	plugin := realm.wire(&GatewayPlugin{
 		next:     next,
 		name:     "test",
 		config:   config,
 		snapshot: setupTestSnapshot(),
-	}
+	})
 
-	expiredClaims := &jwt.RegisteredClaims{
-		ExpiresAt: jwt.NewNumericDate(time.Now().Add(-time.Hour)),
-		Issuer:    "file-convert.online",
-		Subject:   fmt.Sprintf("%d", 1),
-	}
-	token, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, expiredClaims).SignedString([]byte("test-secret"))
+	token := realm.token(t, "1", jwt.MapClaims{"exp": jwt.NewNumericDate(time.Now().Add(-time.Hour))})
 
 	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+	req.Host = "fileconvert.online"
 	req.Header.Set("Authorization", "Bearer "+token)
 	rr := httptest.NewRecorder()
 
@@ -339,7 +308,6 @@ func TestPlugin_ExpiredJWT(t *testing.T) {
 
 func TestPlugin_RequestID_GeneratedAndPreserved(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 
 	var seen string
@@ -374,7 +342,6 @@ func TestPlugin_RequestID_GeneratedAndPreserved(t *testing.T) {
 
 func TestPlugin_UnregisteredEndpoint_PassThrough(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 
 	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
@@ -403,7 +370,6 @@ func TestPlugin_UnregisteredEndpoint_PassThrough(t *testing.T) {
 func newCORSPlugin(t *testing.T) *GatewayPlugin {
 	t.Helper()
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 	config.CORSAllowedOrigins = []string{
 		"https://file-convert.online",
@@ -420,7 +386,6 @@ func newCORSPlugin(t *testing.T) *GatewayPlugin {
 		name:     "test",
 		config:   config,
 		snapshot: setupTestSnapshot(),
-		identity: newIdentityClient("http://localhost:9999", 1*time.Second, nil),
 		planResolver: &PlanResolver{
 			cache: make(map[string]planCacheEntry),
 		},
@@ -541,7 +506,7 @@ func TestPlugin_CORS_NoOrigin_NoACАО(t *testing.T) {
 
 func TestPlugin_AuthenticatedUser_SetsHeaders(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
+	realm := newTestRealm(t)
 	config.DisableRateLimit = true
 
 	var capturedUserID, capturedPlan string
@@ -557,17 +522,17 @@ func TestPlugin_AuthenticatedUser_SetsHeaders(t *testing.T) {
 	}))
 	defer serviceServer.Close()
 
-	plugin := &GatewayPlugin{
+	plugin := realm.wire(&GatewayPlugin{
 		next:         next,
 		name:         "test",
 		config:       config,
 		snapshot:     setupTestSnapshot(),
-		identity:     newIdentityClient("http://localhost:9999", 1*time.Second, nil),
 		planResolver: newPlanResolver(serviceServer.URL, 5*time.Second, nil),
-	}
+	})
 
-	token := createTestToken("test-secret", 99, "file-convert.online", time.Now().Add(time.Hour))
+	token := realm.token(t, "99", nil)
 	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+	req.Host = "fileconvert.online"
 	req.Header.Set("Authorization", "Bearer "+token)
 	rr := httptest.NewRecorder()
 
@@ -589,7 +554,6 @@ func TestPlugin_AuthenticatedUser_SetsHeaders(t *testing.T) {
 // Known host → trusted X-App-Id is stamped on the forwarded request.
 func TestPlugin_AppResolution_KnownHost_StampsHeader(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 
 	var capturedAppID string
@@ -604,7 +568,6 @@ func TestPlugin_AppResolution_KnownHost_StampsHeader(t *testing.T) {
 		config:      config,
 		snapshot:    setupTestSnapshot(),
 		appRegistry: setupTestAppRegistry(),
-		identity:    newIdentityClient("http://localhost:9999", 1*time.Second, nil),
 		planResolver: &PlanResolver{
 			cache: make(map[string]planCacheEntry),
 		},
@@ -628,7 +591,6 @@ func TestPlugin_AppResolution_KnownHost_StampsHeader(t *testing.T) {
 // Inbound client-supplied X-App-Id must be stripped and replaced with the trusted value.
 func TestPlugin_AppResolution_StripsInboundHeader(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 
 	var capturedAppID string
@@ -643,7 +605,6 @@ func TestPlugin_AppResolution_StripsInboundHeader(t *testing.T) {
 		config:      config,
 		snapshot:    setupTestSnapshot(),
 		appRegistry: setupTestAppRegistry(),
-		identity:    newIdentityClient("http://localhost:9999", 1*time.Second, nil),
 		planResolver: &PlanResolver{
 			cache: make(map[string]planCacheEntry),
 		},
@@ -665,7 +626,6 @@ func TestPlugin_AppResolution_StripsInboundHeader(t *testing.T) {
 // Inbound X-App-Id must be stripped even on the pass-through path (unregistered endpoint).
 func TestPlugin_AppResolution_StripsInboundHeader_PassThrough(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 
 	var seen bool
@@ -704,26 +664,25 @@ func TestPlugin_AppResolution_StripsInboundHeader_PassThrough(t *testing.T) {
 // fileconvert host must be rejected with 401.
 func TestPlugin_JWTAppClaim_Mismatch_401(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
+	realm := newTestRealm(t)
 	config.DisableRateLimit = true
 
 	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		rw.WriteHeader(http.StatusOK)
 	})
 
-	plugin := &GatewayPlugin{
+	plugin := realm.wire(&GatewayPlugin{
 		next:        next,
 		name:        "test",
 		config:      config,
 		snapshot:    setupTestSnapshot(),
 		appRegistry: setupTestAppRegistry(),
-		identity:    newIdentityClient("http://localhost:9999", 1*time.Second, nil),
 		planResolver: &PlanResolver{
 			cache: make(map[string]planCacheEntry),
 		},
-	}
+	})
 
-	token := createTestTokenWithApp("test-secret", 99, "file-convert.online", "cms", time.Now().Add(time.Hour))
+	token := realm.token(t, "99", jwt.MapClaims{"app_id": "cms"})
 	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
 	req.Host = "fileconvert.online"
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -739,7 +698,7 @@ func TestPlugin_JWTAppClaim_Mismatch_401(t *testing.T) {
 // Matching token app_id claim → request proceeds and headers are stamped.
 func TestPlugin_JWTAppClaim_Match_OK(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
+	realm := newTestRealm(t)
 	config.DisableRateLimit = true
 
 	var capturedUserID, capturedAppID string
@@ -754,17 +713,16 @@ func TestPlugin_JWTAppClaim_Match_OK(t *testing.T) {
 	}))
 	defer serviceServer.Close()
 
-	plugin := &GatewayPlugin{
+	plugin := realm.wire(&GatewayPlugin{
 		next:         next,
 		name:         "test",
 		config:       config,
 		snapshot:     setupTestSnapshot(),
 		appRegistry:  setupTestAppRegistry(),
-		identity:     newIdentityClient("http://localhost:9999", 1*time.Second, nil),
 		planResolver: newPlanResolver(serviceServer.URL, 5*time.Second, nil),
-	}
+	})
 
-	token := createTestTokenWithApp("test-secret", 99, "file-convert.online", "fileconvert", time.Now().Add(time.Hour))
+	token := realm.token(t, "99", nil)
 	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
 	req.Host = "fileconvert.online"
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -783,48 +741,9 @@ func TestPlugin_JWTAppClaim_Match_OK(t *testing.T) {
 	}
 }
 
-// Legacy token without an app_id claim is accepted during rollout.
-func TestPlugin_JWTAppClaim_LegacyTokenWithoutClaim_OK(t *testing.T) {
-	config := CreateConfig()
-	config.JWTSecret = "test-secret"
-	config.DisableRateLimit = true
-
-	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		rw.WriteHeader(http.StatusOK)
-	})
-
-	serviceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]string{"plan_name": "free"})
-	}))
-	defer serviceServer.Close()
-
-	plugin := &GatewayPlugin{
-		next:         next,
-		name:         "test",
-		config:       config,
-		snapshot:     setupTestSnapshot(),
-		appRegistry:  setupTestAppRegistry(),
-		identity:     newIdentityClient("http://localhost:9999", 1*time.Second, nil),
-		planResolver: newPlanResolver(serviceServer.URL, 5*time.Second, nil),
-	}
-
-	token := createTestToken("test-secret", 99, "file-convert.online", time.Now().Add(time.Hour))
-	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
-	req.Host = "fileconvert.online"
-	req.Header.Set("Authorization", "Bearer "+token)
-	rr := httptest.NewRecorder()
-
-	plugin.ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Errorf("expected 200 for legacy token without app_id claim, got %d", rr.Code)
-	}
-}
-
 // Enforce mode + unknown host → 403.
 func TestPlugin_AppResolution_UnknownHost_Enforce_403(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 	config.AppResolutionMode = "enforce"
 
@@ -854,7 +773,6 @@ func TestPlugin_AppResolution_UnknownHost_Enforce_403(t *testing.T) {
 // Permissive mode + unknown host → 200, no X-App-Id stamped (legacy behaviour).
 func TestPlugin_AppResolution_UnknownHost_Permissive_200(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 	config.AppResolutionMode = "permissive" // local/debug-only mode (no longer the default)
 
@@ -872,7 +790,6 @@ func TestPlugin_AppResolution_UnknownHost_Permissive_200(t *testing.T) {
 		config:      config,
 		snapshot:    setupTestSnapshot(),
 		appRegistry: setupTestAppRegistry(),
-		identity:    newIdentityClient("http://localhost:9999", 1*time.Second, nil),
 		planResolver: &PlanResolver{
 			cache: make(map[string]planCacheEntry),
 		},
@@ -899,7 +816,6 @@ func TestPlugin_AppResolution_UnknownHost_Permissive_200(t *testing.T) {
 // Enforce mode + cold registry (never loaded) → 503.
 func TestPlugin_AppResolution_ColdRegistry_Enforce_503(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 	config.AppResolutionMode = "enforce"
 
@@ -935,7 +851,6 @@ func TestPlugin_AppResolution_ColdRegistry_Enforce_503(t *testing.T) {
 // Disabled mode → no resolution, no stamp, but inbound copy still stripped.
 func TestPlugin_AppResolution_Disabled_StripsButNoStamp(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 	config.AppResolutionMode = "disabled"
 
@@ -951,7 +866,6 @@ func TestPlugin_AppResolution_Disabled_StripsButNoStamp(t *testing.T) {
 		config:      config,
 		snapshot:    setupTestSnapshot(),
 		appRegistry: setupTestAppRegistry(),
-		identity:    newIdentityClient("http://localhost:9999", 1*time.Second, nil),
 		planResolver: &PlanResolver{
 			cache: make(map[string]planCacheEntry),
 		},
@@ -1039,7 +953,6 @@ func TestPlanResolver_AppScopedCache(t *testing.T) {
 // at entry and never forwarded on an anonymous request (nothing re-stamps them).
 func TestPlugin_StripsSpoofedTrustHeaders_Anonymous(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 	config.AppResolutionMode = "disabled"
 
@@ -1057,7 +970,6 @@ func TestPlugin_StripsSpoofedTrustHeaders_Anonymous(t *testing.T) {
 		name:     "test",
 		config:   config,
 		snapshot: setupTestSnapshot(),
-		identity: newIdentityClient("http://localhost:9999", 1*time.Second, nil),
 		planResolver: &PlanResolver{
 			cache: make(map[string]planCacheEntry),
 		},
@@ -1094,7 +1006,6 @@ func TestPlugin_StripsSpoofedTrustHeaders_Anonymous(t *testing.T) {
 // path — the backend must never see a client-injected X-User-Id / X-Is-Admin.
 func TestPlugin_StripsSpoofedTrustHeaders_PassThrough(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 	config.AppResolutionMode = "disabled"
 
@@ -1135,9 +1046,8 @@ func TestPlugin_StripsSpoofedTrustHeaders_PassThrough(t *testing.T) {
 // cleared — only an admin grant re-stamps it.
 func TestPlugin_StripsSpoofedIsAdmin_AuthenticatedNonAdminEndpoint(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
+	realm := newTestRealm(t)
 	config.DisableRateLimit = true
-	config.AppResolutionMode = "disabled"
 
 	var gotIsAdmin string
 	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
@@ -1150,17 +1060,17 @@ func TestPlugin_StripsSpoofedIsAdmin_AuthenticatedNonAdminEndpoint(t *testing.T)
 	}))
 	defer serviceServer.Close()
 
-	plugin := &GatewayPlugin{
+	plugin := realm.wire(&GatewayPlugin{
 		next:         next,
 		name:         "test",
 		config:       config,
 		snapshot:     setupTestSnapshot(),
-		identity:     newIdentityClient("http://localhost:9999", 1*time.Second, nil),
 		planResolver: newPlanResolver(serviceServer.URL, 5*time.Second, nil),
-	}
+	})
 
-	token := createTestToken("test-secret", 7, "file-convert.online", time.Now().Add(time.Hour))
+	token := realm.token(t, "7", nil)
 	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+	req.Host = "fileconvert.online"
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-Is-Admin", "true") // spoof
 	rr := httptest.NewRecorder()
@@ -1172,28 +1082,15 @@ func TestPlugin_StripsSpoofedIsAdmin_AuthenticatedNonAdminEndpoint(t *testing.T)
 	}
 }
 
-// ── Admin/roles stamping on public endpoints (legacy tokens) ─────────────────
+// ── Admin/roles stamping on public endpoints ─────────────────────────────────
 
-// A legacy-token admin on a PUBLIC (non-gated) endpoint gets X-Is-Admin and
-// X-User-Roles stamped, exactly as on a gated endpoint / Keycloak path, so a
-// backend can offer operator-only behaviour on a public route.
-func TestPlugin_PublicEndpoint_LegacyAdmin_StampsIsAdmin(t *testing.T) {
+// An admin on a PUBLIC (non-gated) endpoint gets X-Is-Admin and X-User-Roles
+// stamped from the token roles, exactly as on a gated endpoint, so a backend
+// can offer operator-only behaviour on a public route.
+func TestPlugin_PublicEndpoint_Admin_StampsIsAdmin(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
+	realm := newTestRealm(t)
 	config.DisableRateLimit = true
-	config.AppResolutionMode = "disabled"
-
-	identityServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status": "success",
-			"data": map[string]interface{}{
-				"roles":       []string{"Admin"},
-				"permissions": []string{"*"},
-				"is_admin":    true,
-			},
-		})
-	}))
-	defer identityServer.Close()
 
 	serviceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"plan_name": "free"})
@@ -1208,17 +1105,17 @@ func TestPlugin_PublicEndpoint_LegacyAdmin_StampsIsAdmin(t *testing.T) {
 		rw.WriteHeader(http.StatusOK)
 	})
 
-	plugin := &GatewayPlugin{
+	plugin := realm.wire(&GatewayPlugin{
 		next:         next,
 		name:         "test",
 		config:       config,
 		snapshot:     setupTestSnapshot(),
-		identity:     newIdentityClient(identityServer.URL, 5*time.Second, nil),
 		planResolver: newPlanResolver(serviceServer.URL, 5*time.Second, nil),
-	}
+	})
 
-	token := createTestToken("test-secret", 7, "file-convert.online", time.Now().Add(time.Hour))
+	token := realm.admin(t, "7")
 	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+	req.Host = "fileconvert.online"
 	req.Header.Set("Authorization", "Bearer "+token)
 	rr := httptest.NewRecorder()
 
@@ -1233,30 +1130,17 @@ func TestPlugin_PublicEndpoint_LegacyAdmin_StampsIsAdmin(t *testing.T) {
 	if gotIsAdmin != "true" {
 		t.Errorf("expected X-Is-Admin=true on public endpoint for admin, got %q", gotIsAdmin)
 	}
-	if gotRoles != "Admin" {
-		t.Errorf("expected X-User-Roles=Admin, got %q", gotRoles)
+	if gotRoles != "admin" {
+		t.Errorf("expected X-User-Roles=admin, got %q", gotRoles)
 	}
 }
 
-// A legacy-token NON-admin on a public endpoint is forwarded without the admin
-// header (and a spoofed inbound copy stays stripped).
-func TestPlugin_PublicEndpoint_LegacyNonAdmin_NoIsAdmin(t *testing.T) {
+// A NON-admin on a public endpoint is forwarded without the admin header (and
+// a spoofed inbound copy stays stripped).
+func TestPlugin_PublicEndpoint_NonAdmin_NoIsAdmin(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
+	realm := newTestRealm(t)
 	config.DisableRateLimit = true
-	config.AppResolutionMode = "disabled"
-
-	identityServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status": "success",
-			"data": map[string]interface{}{
-				"roles":       []string{"Member"},
-				"permissions": []string{},
-				"is_admin":    false,
-			},
-		})
-	}))
-	defer identityServer.Close()
 
 	serviceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"plan_name": "free"})
@@ -1270,17 +1154,17 @@ func TestPlugin_PublicEndpoint_LegacyNonAdmin_NoIsAdmin(t *testing.T) {
 		rw.WriteHeader(http.StatusOK)
 	})
 
-	plugin := &GatewayPlugin{
+	plugin := realm.wire(&GatewayPlugin{
 		next:         next,
 		name:         "test",
 		config:       config,
 		snapshot:     setupTestSnapshot(),
-		identity:     newIdentityClient(identityServer.URL, 5*time.Second, nil),
 		planResolver: newPlanResolver(serviceServer.URL, 5*time.Second, nil),
-	}
+	})
 
-	token := createTestToken("test-secret", 8, "file-convert.online", time.Now().Add(time.Hour))
+	token := realm.token(t, "8", nil)
 	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
+	req.Host = "fileconvert.online"
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-Is-Admin", "true") // spoof
 	rr := httptest.NewRecorder()
@@ -1293,71 +1177,14 @@ func TestPlugin_PublicEndpoint_LegacyNonAdmin_NoIsAdmin(t *testing.T) {
 	if gotIsAdmin != "" {
 		t.Errorf("expected no X-Is-Admin for non-admin, got %q", gotIsAdmin)
 	}
-	if gotRoles != "Member" {
-		t.Errorf("expected X-User-Roles=Member, got %q", gotRoles)
-	}
-}
-
-// Identity unavailable on a public endpoint must fail SOFT: the request is still
-// forwarded (200) without admin/roles, and the failure is negatively cached so
-// the second request does not hit identity again.
-func TestPlugin_PublicEndpoint_IdentityDown_FailsSoftAndCaches(t *testing.T) {
-	config := CreateConfig()
-	config.JWTSecret = "test-secret"
-	config.DisableRateLimit = true
-	config.AppResolutionMode = "disabled"
-
-	var identityCalls int32
-	identityServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&identityCalls, 1)
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer identityServer.Close()
-
-	serviceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]string{"plan_name": "free"})
-	}))
-	defer serviceServer.Close()
-
-	var gotIsAdmin string
-	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		gotIsAdmin = req.Header.Get("X-Is-Admin")
-		rw.WriteHeader(http.StatusOK)
-	})
-
-	plugin := &GatewayPlugin{
-		next:         next,
-		name:         "test",
-		config:       config,
-		snapshot:     setupTestSnapshot(),
-		identity:     newIdentityClient(identityServer.URL, 5*time.Second, nil),
-		planResolver: newPlanResolver(serviceServer.URL, 5*time.Second, nil),
-	}
-
-	token := createTestToken("test-secret", 9, "file-convert.online", time.Now().Add(time.Hour))
-	for i := 0; i < 2; i++ {
-		req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/convert", nil)
-		req.Header.Set("Authorization", "Bearer "+token)
-		rr := httptest.NewRecorder()
-		plugin.ServeHTTP(rr, req)
-		if rr.Code != http.StatusOK {
-			t.Fatalf("request %d: expected 200 when identity is down, got %d", i, rr.Code)
-		}
-		if gotIsAdmin != "" {
-			t.Errorf("request %d: expected no X-Is-Admin when identity is down, got %q", i, gotIsAdmin)
-		}
-	}
-	// Authz tries /authz then falls back to the admin-status call: 2 calls for
-	// the first request, none for the second (negative cache).
-	if n := atomic.LoadInt32(&identityCalls); n != 2 {
-		t.Errorf("expected identity to be called twice (authz + admin fallback) then negatively cached, got %d", n)
+	if gotRoles != "member" {
+		t.Errorf("expected X-User-Roles=member, got %q", gotRoles)
 	}
 }
 
 // Unknown host in enforce mode → 403 and the request is NEVER forwarded.
 func TestPlugin_UnknownHost_Enforce_NotForwarded(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 	config.AppResolutionMode = "enforce"
 
@@ -1392,7 +1219,6 @@ func TestPlugin_UnknownHost_Enforce_NotForwarded(t *testing.T) {
 // Unauthenticated request to an admin endpoint → 401 and NOT forwarded.
 func TestPlugin_AdminEndpoint_NoAuth_NotForwarded(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 	config.AppResolutionMode = "disabled"
 
@@ -1407,7 +1233,6 @@ func TestPlugin_AdminEndpoint_NoAuth_NotForwarded(t *testing.T) {
 		name:     "test",
 		config:   config,
 		snapshot: setupTestSnapshot(),
-		identity: newIdentityClient("http://localhost:9999", 1*time.Second, nil),
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/conversion/v1/admin/users", nil)
@@ -1426,7 +1251,6 @@ func TestPlugin_AdminEndpoint_NoAuth_NotForwarded(t *testing.T) {
 // Preflight from an unknown host still returns 204 with ACAO — CORS precedes resolution.
 func TestPlugin_CORS_Preflight_UnknownHost_Enforce(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 	config.AppResolutionMode = "enforce"
 	config.CORSAllowedOrigins = []string{"https://file-convert.online"}
@@ -1461,30 +1285,6 @@ func TestPlugin_CORS_Preflight_UnknownHost_Enforce(t *testing.T) {
 
 // --- RBAC v2 permission gate (PERMISSIONS_STRATEGY.md) ---
 
-func newAuthzIdentityServer(t *testing.T, roles, permissions []string, isAdmin bool, authzStatus int) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/authz") {
-			if authzStatus != http.StatusOK {
-				w.WriteHeader(authzStatus)
-				return
-			}
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"status": "success", "message": "ok",
-				"data": map[string]interface{}{
-					"roles": roles, "permissions": permissions, "is_admin": isAdmin,
-				},
-			})
-			return
-		}
-		// Legacy admin-status fallback path.
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status": "success", "message": "ok",
-			"data": map[string]bool{"is_admin": isAdmin},
-		})
-	}))
-}
-
 func newPlanServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1492,72 +1292,25 @@ func newPlanServer(t *testing.T) *httptest.Server {
 	}))
 }
 
-func TestPlugin_PermissionEndpoint_ModeratorAllowed(t *testing.T) {
-	config := CreateConfig()
-	config.JWTSecret = "test-secret"
-	config.DisableRateLimit = true
-
-	identityServer := newAuthzIdentityServer(t, []string{"Moderator"}, []string{"content.moderate"}, false, http.StatusOK)
-	defer identityServer.Close()
-	planServer := newPlanServer(t)
-	defer planServer.Close()
-
-	var gotRoles, gotIsAdmin string
-	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		gotRoles = req.Header.Get("X-User-Roles")
-		gotIsAdmin = req.Header.Get("X-Is-Admin")
-		rw.WriteHeader(http.StatusOK)
-	})
-
-	plugin := &GatewayPlugin{
-		next:         next,
-		name:         "test",
-		config:       config,
-		snapshot:     setupTestSnapshot(),
-		identity:     newIdentityClient(identityServer.URL, 5*time.Second, nil),
-		planResolver: newPlanResolver(planServer.URL, 5*time.Second, nil),
-	}
-
-	token := createTestToken("test-secret", 42, "file-convert.online", time.Now().Add(time.Hour))
-	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/comments/hide", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	rr := httptest.NewRecorder()
-
-	plugin.ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Errorf("expected 200 for moderator, got %d", rr.Code)
-	}
-	if gotRoles != "Moderator" {
-		t.Errorf("expected X-User-Roles=Moderator, got %q", gotRoles)
-	}
-	if gotIsAdmin != "" {
-		t.Errorf("moderator is not admin; expected no X-Is-Admin, got %q", gotIsAdmin)
-	}
-}
-
 func TestPlugin_PermissionEndpoint_InsufficientPermissions(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
+	realm := newTestRealm(t)
 	config.DisableRateLimit = true
-
-	identityServer := newAuthzIdentityServer(t, []string{"User"}, []string{}, false, http.StatusOK)
-	defer identityServer.Close()
 
 	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		rw.WriteHeader(http.StatusOK)
 	})
 
-	plugin := &GatewayPlugin{
+	plugin := realm.wire(&GatewayPlugin{
 		next:     next,
 		name:     "test",
 		config:   config,
 		snapshot: setupTestSnapshot(),
-		identity: newIdentityClient(identityServer.URL, 5*time.Second, nil),
-	}
+	})
 
-	token := createTestToken("test-secret", 42, "file-convert.online", time.Now().Add(time.Hour))
+	token := realm.token(t, "42", nil)
 	req := httptest.NewRequest(http.MethodPost, "/api/conversion/v1/comments/hide", nil)
+	req.Host = "fileconvert.online"
 	req.Header.Set("Authorization", "Bearer "+token)
 	rr := httptest.NewRecorder()
 
@@ -1570,7 +1323,6 @@ func TestPlugin_PermissionEndpoint_InsufficientPermissions(t *testing.T) {
 
 func TestPlugin_PermissionEndpoint_AnonymousUnauthorized(t *testing.T) {
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 
 	plugin := &GatewayPlugin{
@@ -1587,46 +1339,5 @@ func TestPlugin_PermissionEndpoint_AnonymousUnauthorized(t *testing.T) {
 
 	if rr.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401 for anonymous on permission-gated endpoint, got %d", rr.Code)
-	}
-}
-
-func TestPlugin_AdminEndpoint_AuthzFallbackToAdminStatus(t *testing.T) {
-	config := CreateConfig()
-	config.JWTSecret = "test-secret"
-	config.DisableRateLimit = true
-
-	// Older identity-service: /authz 404s, /admin-status works.
-	identityServer := newAuthzIdentityServer(t, nil, nil, true, http.StatusNotFound)
-	defer identityServer.Close()
-	planServer := newPlanServer(t)
-	defer planServer.Close()
-
-	var gotIsAdmin string
-	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		gotIsAdmin = req.Header.Get("X-Is-Admin")
-		rw.WriteHeader(http.StatusOK)
-	})
-
-	plugin := &GatewayPlugin{
-		next:         next,
-		name:         "test",
-		config:       config,
-		snapshot:     setupTestSnapshot(),
-		identity:     newIdentityClient(identityServer.URL, 5*time.Second, nil),
-		planResolver: newPlanResolver(planServer.URL, 5*time.Second, nil),
-	}
-
-	token := createTestToken("test-secret", 42, "file-convert.online", time.Now().Add(time.Hour))
-	req := httptest.NewRequest(http.MethodGet, "/api/conversion/v1/admin/users", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	rr := httptest.NewRecorder()
-
-	plugin.ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Errorf("expected 200 via admin-status fallback, got %d", rr.Code)
-	}
-	if gotIsAdmin != "true" {
-		t.Errorf("expected X-Is-Admin=true via fallback, got %q", gotIsAdmin)
 	}
 }

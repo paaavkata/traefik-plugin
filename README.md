@@ -4,9 +4,9 @@ Traefik middleware plugin for the FileConvert API gateway. Handles JWT authentic
 
 ## Features
 
-- **JWT validation (dual-issuer)** — Keycloak RS256 tokens (JWKS, per-`kid` key cache) for apps listed in `keycloakApps` / `keycloakRealms` (today: every app — `scantinel`, `fileconvert`), legacy HS256 identity-service tokens (shared secret) only for apps with no realm; rejects expired/tampered tokens, fails closed
+- **JWT validation (Keycloak only)** — RS256 tokens (JWKS, per-`kid` key cache) validated against the realm bound to the resolved app (`keycloakApps` / `keycloakRealms`; today every app — `scantinel`, `fileconvert`) or the `operatorRealm`. An app with no realm accepts no bearer token at all (401). The HS256 shared-secret path (`jwtSecret`/`jwtIssuer`, identity-service tokens) was removed 2026-10; those keys are ignored. Rejects expired/tampered tokens, fails closed
 - **Policy authorization** (`authorizationMode: policy`, `authz.go`/`policy.go`) — the principal's Keycloak roles resolve through the registry snapshot's role bindings to policies; a request passes when a statement grants the endpoint's `required_permission` on the target application. The target application is a validated inbound `X-App-Id` (operator consoles) or the host's app. `X-Is-Admin` is derived from a literal `*` grant. `GET /api/_iam/me` is answered by the plugin. See "Policy authorization" below.
-- **Admin access control (legacy engine)** — `authorizationMode: legacy` (default): endpoints marked `admin` in the registry require an admin role (`keycloakAdminRoles` for Keycloak tokens, identity-service for HS256); the policy verdict is still computed and logged as `shadow=`
+- **Admin access control (legacy engine)** — `authorizationMode: legacy` (default): endpoints marked `admin` in the registry require an admin role from the token (`keycloakAdminRoles`); the policy verdict is still computed and logged as `shadow=`
 - **Rate limiting** — fixed-window limiter backed by Redis, per-user or per-session, plan-aware limits from service-service snapshot
 - **Registry snapshot** — polls service-service for endpoint metadata (access levels, rate limits per plan)
 - **Plan resolution** — resolves user's plan tier via service-service customer rate-tier endpoint, scoped per `(app_id, user_id)`
@@ -22,7 +22,7 @@ Client → Nginx LB (TLS) → Traefik + Plugin → Backend Service
         ┌──────────────┬─────────┼──────────────┬──────────────┐
         │              │         │              │              │
  application-service  service-service   identity-service     Redis
- (host→app_id)       (snapshot/plan)   (admin check)     (rate limits)
+ (host→app_id)       (snapshot/plan)   (API-key verify)   (rate limits)
 ```
 
 The plugin resolves `app_id` from the request host first (Step 1a): it unconditionally
@@ -36,12 +36,10 @@ All options are configurable via the Traefik Middleware CRD (see `helm/middlewar
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `jwtSecret` | — | HMAC secret for JWT verification (legacy HS256 path — only apps with no Keycloak realm; empty = HS256 tokens rejected) |
-| `jwtIssuer` | `file-convert.online` | Expected JWT issuer (HS256 path) |
 | `keycloakApps` | `[]` | app_ids validated on the Keycloak RS256/JWKS path (e.g. `[scantinel]`). Empty = Keycloak path disabled entirely |
 | `keycloakJwksUrl` | — | Realm JWKS endpoint (or OIDC discovery URL; `jwks_uri` is followed). Required when `keycloakApps` is set |
 | `keycloakIssuer` | — | Expected `iss`, byte-for-byte (realm public URL). Required when `keycloakApps` is set |
-| `keycloakRealms` | `[]` | Per-app realms: list of `{appId, issuer, jwksUrl}`. Makes `appId` a Keycloak app validated against ITS realm (overrides the scalar realm for that app); an HS256 token on such an app is a 401. `acceptLegacy: true` (DEPRECATED, removed next release) additionally accepted legacy HS256 identity-service tokens for that app during the migration window; logged as a warning at startup |
+| `keycloakRealms` | `[]` | Per-app realms: list of `{appId, issuer, jwksUrl}`. Makes `appId` a Keycloak app validated against ITS realm (overrides the scalar realm for that app); any token not issued by that realm (or the `operatorRealm`) is a 401 |
 | `userUidHeader` | `X-User-Uid` | Stamped with the Keycloak `sub` (UUID) on the Keycloak path only; always stripped inbound |
 | `userEmailHeader` | _(empty = inert)_ | When set (e.g. `X-User-Email`): always stripped inbound; stamped only on the Keycloak path from `email` when `email_verified` is `true`. Enabled per env in the Middleware |
 | `keycloakUserIdClaim` | `luid` | Claim stamped into `X-User-Id` (legacy_user_id mapper), falling back to `sub` |
@@ -62,7 +60,6 @@ All options are configurable via the Traefik Middleware CRD (see `helm/middlewar
 | `appIdHeader` | `X-App-Id` | Trusted, gateway-stamped app id header (inbound copies stripped) |
 | `appResolutionMode` | `enforce` | `enforce` (**default**; unknown/inactive host → 403, cold registry → 503 — there are NO endpoints allowed without a resolved app_id), `permissive` (pass through, no stamp — local/debug only, do not use in production), or `disabled` (skip resolution — local single-app dev only) |
 | `trustForwardedHost` | `false` | When true resolve from `X-Forwarded-Host`; otherwise from `req.Host` |
-| `identityServiceUrl` | `http://identity-service:8080` | Identity service URL |
 | `identityVerifyUrl` | `http://identity-service:8080/internal/v1/api-keys/verify` | Internal API-key verify endpoint (contract §4). Not registry-registered; full in-cluster path. Verify call is capped at ≤2s; identity unreachable → 503 for key traffic only |
 | `apiKeyUidHeader` | `X-Api-Key-Uid` | Trusted, gateway-stamped API-key uid header (inbound copies stripped on every path) |
 | `usageServiceUrl` | `http://usage-service:8080` | Usage service URL |
@@ -127,13 +124,12 @@ Per request:
    `403 unknown_app`), else the host's application. The header is re-stamped with the
    authorized value; a route registered for the host app but not exposed to the target is
    refused (`403`, `reason=endpoint_not_exposed`), never passed through.
-2. **Credential**: HS256 only on apps with no Keycloak realm; RS256 validated by
-   the realm whose `iss` the token carries, out of {target app's realm, `operatorRealm`}.
+2. **Credential**: API key, or RS256 token validated by the realm whose `iss` it
+   carries, out of {target app's realm, `operatorRealm`}.
    Any other issuer → `401` (`reason=issuer_rejected`). No replay guard: scope is policy.
 3. **Principal**: Keycloak subject, user id, `app_id` claim as home application, qualified
-   roles → bound policies → statements. Legacy HS256 principals get a synthetic set from
-   identity-service `/authz` (permissions on `@home`, `is_admin` ⇒ `*` on `@home`).
-   API keys get `authenticated` on their bound application.
+   roles → bound policies → statements. API keys get `authenticated` on their bound
+   application.
 4. **Evaluation**: `required_permission` empty → open; no token → `401 reason=no_token`;
    no statement grants it on the target → `403 reason=no_matching_statement`.
    `authenticated` is granted only by `*` or the literal `authenticated`.
@@ -167,17 +163,16 @@ resolution:
   cross-app replay check (`token.app_id == host app_id`) runs unchanged.
 - `app_id` bound by `keycloakRealms` (e.g. `fileconvert`) → the same RS256 + JWKS validation
   against that app's own realm.
-- an app with no realm at all (none in dev/prod today) → the **HS256 shared-secret** path
-  (`jwtSecret`, `jwtIssuer`); with `jwtSecret` empty, HS256 tokens are rejected.
+- an app with no realm at all (none in dev/prod today), or an unresolved app
+  (`appResolutionMode` permissive/disabled) → every bearer token is a 401
+  (`reason=issuer_rejected`); anonymous requests still pass free endpoints.
 
-Each path pins its algorithm (`WithValidMethods`), so an HS256 token can never validate on
-the Keycloak path or vice versa (alg-confusion guard in both directions).
+The validator pins RS256 (`WithValidMethods`); HS256 / `alg=none` tokens never validate.
 
 Downstream header contract is frozen: `X-User-Id` (claim `keycloakUserIdClaim`, default
 `luid`, falling back to `sub`), `X-App-Id` (host registry, unchanged), `X-Is-Admin` /
 `X-User-Roles` (from token roles: `resource_access[azp].roles` + `realm_access.roles` — no
-identity-service round-trip for Keycloak tokens), `X-User-Plan` (service-service rate-tier,
-unchanged).
+identity-service round-trip), `X-User-Plan` (service-service rate-tier, unchanged).
 
 JWKS handling: keys cached by `kid`; unknown `kid` triggers an on-demand refetch (rotation
 pickup) rate-limited by `jwksRefetchCooldown`; a background refresh runs every
@@ -186,9 +181,10 @@ outage does not invalidate existing sessions (only new logins/refreshes fail, at
 
 **Yaegi note:** the JWKS client is hand-rolled on stdlib only (`net/http`,
 `encoding/json`, `encoding/base64`, `math/big`, `crypto/rsa`) — no JOSE library — because
-the plugin runs interpreted. RS256 verification itself is done by the already-vendored
-`golang-jwt/jwt/v5`, whose full package (including `rsa.go`) is already interpreted by
-Yaegi today for the HS256 path. Still, smoke-test on a dev cluster before relying on it.
+the plugin runs interpreted. RS256 verification itself is done by the vendored
+`golang-jwt/jwt/v5`. `go test` cannot catch interpreter-only bugs (2026-10-16 prod 500s):
+run `cd hack/yaegi-harness && GOWORK=off go run -mod=vendor . ../..` before releasing
+(the CI template runs it between `go test` and the image build).
 
 ### infra-gitops requirements (dev + prod middleware manifests)
 
@@ -216,8 +212,8 @@ Also required in infra-gitops:
 3. **Realm prerequisites** (plan Appendix A): `scantinel-web` client with the
    `oidc-hardcoded-claim-mapper` for `app_id=scantinel`, the `luid` user-attribute mapper,
    and client roles `admin`/`owner`.
-4. Rollback: set `keycloakApps: []` (or drop the block) — the plugin reverts to
-   HS256-only behaviour; no image change needed.
+4. Rollback of a realm binding: drop the app from `keycloakApps` / `keycloakRealms` —
+   that app then rejects every bearer token (there is no HS256 fallback).
 
 ## Deployment
 
@@ -243,11 +239,8 @@ go test ./...
 
 ## Identity Service Requirement
 
-The plugin expects a `GET /v1/user/:id/admin-status` endpoint on identity-service returning:
-
-```json
-{"status": "success", "data": {"is_admin": true}}
-```
+Only the internal API-key verify endpoint (`identityVerifyUrl`, contract §4). The
+admin-status / authz lookups used by the removed HS256 path are no longer called.
 
 ### X-User-Id for Keycloak principals
 

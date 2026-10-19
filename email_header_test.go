@@ -24,11 +24,9 @@ func TestPlugin_UserEmailHeader(t *testing.T) {
 		c["email_verified"] = verified
 		return mintKeycloakToken(t, k1, "kid-s", c)
 	}
-	legacy := createTestTokenWithApp("test-secret", 7, "file-convert.online", "fileconvert", time.Now().Add(time.Hour))
-
-	on := newTwoRealmPlugin(t, ts1, ts2, true, next)
+	on := newTwoRealmPlugin(t, ts1, ts2, next)
 	on.config.UserEmailHeader = "X-User-Email"
-	off := newTwoRealmPlugin(t, ts1, ts2, true, next)
+	off := newTwoRealmPlugin(t, ts1, ts2, next)
 
 	cases := []struct {
 		name  string
@@ -42,7 +40,6 @@ func TestPlugin_UserEmailHeader(t *testing.T) {
 		{"verified as string is not verified", on, scanURL, claims("me@example.com", "true"), ""},
 		{"anonymous: spoof stripped", on, scanURL, "", ""},
 		{"unregistered path: spoof stripped", on, "http://scantinel.ai/api/scan/v1/schedules", claims("me@example.com", true), ""},
-		{"legacy HS256: spoof stripped", on, fcURL, legacy, ""},
 		{"not configured: inert", off, scanURL, claims("me@example.com", true), "victim@example.com"},
 	}
 	for _, tc := range cases {

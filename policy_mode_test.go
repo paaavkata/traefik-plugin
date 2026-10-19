@@ -104,13 +104,12 @@ func newPolicyHarness(t *testing.T, mode string) *policyHarness {
 	h.opKey = h.operator.newKey("kid-o")
 
 	config := CreateConfig()
-	config.JWTSecret = "test-secret"
 	config.DisableRateLimit = true
 	config.AuthorizationMode = mode
 	config.KeycloakApps = []string{"scantinel"}
 	config.KeycloakJWKSURL = h.tenant.srv.URL
 	config.KeycloakIssuer = testKeycloakIssuer
-	config.KeycloakRealms = []KeycloakRealm{{AppID: "fileconvert", Issuer: testFCIssuer, JWKSURL: h.fc.srv.URL, AcceptLegacy: true}}
+	config.KeycloakRealms = []KeycloakRealm{{AppID: "fileconvert", Issuer: testFCIssuer, JWKSURL: h.fc.srv.URL}}
 	config.OperatorRealm = KeycloakRealm{Issuer: testOperatorIssuer, JWKSURL: h.operator.srv.URL}
 	config.UserEmailHeader = "X-User-Email"
 
@@ -207,8 +206,8 @@ func TestPolicy_TenantTokenOnAnotherTenant_401(t *testing.T) {
 	if !strings.Contains(h.logs.String(), "reason=issuer_rejected") {
 		t.Errorf("missing reason code in logs:\n%s", h.logs.String())
 	}
-	// Legacy HS256 is not accepted on a Keycloak-only app either.
-	legacy := createTestTokenWithApp("test-secret", 7, "file-convert.online", "scantinel", time.Now().Add(time.Hour))
+	// HS256 is not accepted anywhere.
+	legacy := mintHS256Token("test-secret", 7, "file-convert.online", "scantinel", time.Now().Add(time.Hour))
 	if rr := h.do(http.MethodGet, "http://scantinel.ai/api/cms/v1/open", legacy, nil); rr.Code != http.StatusUnauthorized {
 		t.Fatalf("HS256 on scantinel: expected 401, got %d", rr.Code)
 	}
@@ -341,31 +340,6 @@ func TestPolicy_RateLimitKeyedByTargetAndWildcardExempt(t *testing.T) {
 }
 
 // --- legacy adapter --------------------------------------------------------
-
-func TestPolicy_LegacyPrincipalThroughEvaluator(t *testing.T) {
-	h := newPolicyHarness(t, "policy")
-	identity := newAuthzIdentityServer(t, []string{"Moderator"}, []string{"content.moderate", "content.publish"}, false, http.StatusOK)
-	defer identity.Close()
-	h.p.identity = newIdentityClient(identity.URL, 2*time.Second, nil)
-	legacy := createTestTokenWithApp("test-secret", 42, "file-convert.online", "fileconvert", time.Now().Add(time.Hour))
-
-	if rr := h.do(http.MethodPost, "http://fileconvert.online/api/cms/v1/content/x/publish", legacy, nil); rr.Code != http.StatusOK {
-		t.Fatalf("legacy moderator: %d %s", rr.Code, rr.Body.String())
-	}
-	if h.got.Get("X-User-Id") != "42" || h.got.Get("X-Is-Admin") != "" || h.got.Get("X-User-Roles") != "Moderator" {
-		t.Errorf("legacy headers id=%q admin=%q roles=%q", h.got.Get("X-User-Id"), h.got.Get("X-Is-Admin"), h.got.Get("X-User-Roles"))
-	}
-	if rr := h.do(http.MethodPost, "http://fileconvert.online/api/cms/v1/refund", legacy, nil); rr.Code != http.StatusForbidden {
-		t.Fatalf("legacy moderator refund: expected 403, got %d", rr.Code)
-	}
-	// Legacy admin ⇒ * on @home.
-	adminIdentity := newAuthzIdentityServer(t, []string{"admin"}, []string{"*"}, true, http.StatusOK)
-	defer adminIdentity.Close()
-	h.p.identity = newIdentityClient(adminIdentity.URL, 2*time.Second, nil)
-	if rr := h.do(http.MethodPost, "http://fileconvert.online/api/cms/v1/refund", legacy, nil); rr.Code != http.StatusOK || h.got.Get("X-Is-Admin") != "true" {
-		t.Fatalf("legacy admin: %d admin=%q", rr.Code, h.got.Get("X-Is-Admin"))
-	}
-}
 
 // --- API keys ----------------------------------------------------------------
 

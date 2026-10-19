@@ -149,17 +149,14 @@ import (
 func YaegiProbeRealms(scantinelJWKS, fileconvertJWKS, dummyURL string, n int) string {
 	for i := 0; i < n; i++ {
 		cfg := CreateConfig()
-		cfg.JWTSecret = "x"
-		cfg.JWTIssuer = "file-convert.online"
 		cfg.ServiceServiceURL = dummyURL
-		cfg.IdentityServiceURL = dummyURL
 		cfg.AppResolutionMode = "disabled"
 		cfg.DisableRateLimit = true
 		cfg.LogLevel = "error"
 		cfg.KeycloakApps = []string{"scantinel"}
 		cfg.KeycloakIssuer = "https://auth.scantinel.ai/realms/scantinel"
 		cfg.KeycloakJWKSURL = scantinelJWKS
-		cfg.KeycloakRealms = []KeycloakRealm{{AppID: "fileconvert", Issuer: "https://auth.file-convert.online/realms/fileconvert", JWKSURL: fileconvertJWKS, AcceptLegacy: true}}
+		cfg.KeycloakRealms = []KeycloakRealm{{AppID: "fileconvert", Issuer: "https://auth.file-convert.online/realms/fileconvert", JWKSURL: fileconvertJWKS}}
 		h, err := New(context.Background(), http.NotFoundHandler(), cfg, "probe")
 		if err != nil {
 			return "New: " + err.Error()

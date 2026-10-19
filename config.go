@@ -4,16 +4,15 @@ import "time"
 
 // Config holds the plugin configuration set via Traefik static/dynamic config.
 type Config struct {
-	// JWT (legacy HS256 shared-secret path — identity-service tokens). This remains
-	// the validator for every app NOT listed in KeycloakApps.
-	JWTSecret    string `json:"jwtSecret" yaml:"jwtSecret"`
-	JWTIssuer    string `json:"jwtIssuer" yaml:"jwtIssuer"`
+	// JWTHeaderKey is the header carrying the bearer token (default Authorization).
 	JWTHeaderKey string `json:"jwtHeaderKey" yaml:"jwtHeaderKey"`
 
-	// --- Keycloak / dual-issuer (RS256 + JWKS) ---------------------------------
-	// Apps listed in KeycloakApps authenticate against Keycloak; all other apps keep
-	// the HS256 path above unchanged. Leaving KeycloakApps empty disables the
-	// Keycloak path entirely (behaviour identical to before this feature existed).
+	// --- Keycloak (RS256 + JWKS) ----------------------------------------------
+	// Bearer tokens are validated ONLY against the realm bound to the resolved
+	// app (KeycloakApps + scalar realm, or KeycloakRealms) or the OperatorRealm.
+	// An app with no realm rejects every bearer token (401); the HS256
+	// shared-secret path (jwtSecret/jwtIssuer, identity-service tokens) was
+	// removed in 2026-10 — those YAML keys are now ignored.
 
 	// KeycloakApps is the list of app_ids (as resolved from the request host via the
 	// application registry) whose bearer tokens are validated on the Keycloak
@@ -46,7 +45,7 @@ type Config struct {
 	OperatorRealm KeycloakRealm `json:"operatorRealm" yaml:"operatorRealm"`
 
 	// AuthorizationMode selects the authorization engine:
-	//   "legacy" — (DEFAULT) today's path: keycloakAdminRoles / identity authz,
+	//   "legacy" — (DEFAULT) today's path: keycloakAdminRoles from token roles,
 	//              host-pinned app, token.app_id must equal the host app. The
 	//              policy outcome is still computed and logged as `shadow=`.
 	//   "policy" — gateway-iam-policies: principal roles → snapshot bindings →
@@ -129,14 +128,11 @@ type Config struct {
 	// original Host survives, so this is a flag defaulting to the safe req.Host.
 	TrustForwardedHost bool `json:"trustForwardedHost" yaml:"trustForwardedHost"`
 
-	// Identity-service
-	IdentityServiceURL string `json:"identityServiceUrl" yaml:"identityServiceUrl"`
-
 	// IdentityVerifyURL is the in-cluster endpoint the gateway POSTs API-key
 	// verification requests to (contract §4). It is NOT registered in the service
 	// registry (internal service-to-service call), so it carries the full path.
-	// Default: identity-service's /internal/v1/api-keys/verify. Same in-cluster URL
-	// convention as IdentityServiceURL.
+	// Default: identity-service's /internal/v1/api-keys/verify. (identityServiceUrl,
+	// the old authz/admin-status base URL, is no longer read.)
 	IdentityVerifyURL string `json:"identityVerifyUrl" yaml:"identityVerifyUrl"`
 
 	// ApiKeyUidHeader is the trusted, gateway-stamped header carrying the resolved
@@ -194,19 +190,11 @@ type KeycloakRealm struct {
 	AppID   string `json:"appId" yaml:"appId"`
 	Issuer  string `json:"issuer" yaml:"issuer"`   // exact expected `iss`
 	JWKSURL string `json:"jwksUrl" yaml:"jwksUrl"` // JWKS or OIDC discovery URL
-	// AcceptLegacy: DEPRECATED, removed in the next release. It also accepted
-	// legacy HS256 identity-service tokens for this app (jwtSecret path) during
-	// the identity-service -> Keycloak migration window. fileconvert dev and
-	// prod are Keycloak-only since 2026-10-15; the Middlewares no longer set it.
-	// Default false: an HS256 token on a Keycloak app is a 401. Setting it
-	// still works for one release (logged as a warning at startup).
-	AcceptLegacy bool `json:"acceptLegacy" yaml:"acceptLegacy"`
 }
 
 // CreateConfig creates the default plugin configuration.
 func CreateConfig() *Config {
 	return &Config{
-		JWTIssuer:                       "file-convert.online",
 		JWTHeaderKey:                    "Authorization",
 		KeycloakUserIDClaim:             "luid",
 		AuthorizationMode:               "legacy",
@@ -226,7 +214,6 @@ func CreateConfig() *Config {
 		AppSnapshotVersionPollInterval:  "5s",
 		AppIDHeader:                     "X-App-Id",
 		AppResolutionMode:               "enforce",
-		IdentityServiceURL:              "http://identity-service:8080",
 		IdentityVerifyURL:               "http://identity-service:8080/internal/v1/api-keys/verify",
 		ApiKeyUidHeader:                 "X-Api-Key-Uid",
 		UsageServiceURL:                 "http://usage-service:8080",
